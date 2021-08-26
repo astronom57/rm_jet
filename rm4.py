@@ -1,25 +1,25 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Created on Tue Mar 10 15:49:22 2020
+Created on 2021-08-25
 
-@author: mlisakov
-"""
+DISCLAIMER: This is a newer, more general, and more usable version of the rm3.py 
+script that was used for the "Overzised sheath..." paper. 
+All specific slices, their coordinates, etc. can be found in the rm3.py script
 
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Created on 2019-08-28 
+Script to analyze Rotation Measure maps. The most common use case is to make slices 
+across or along the jet direction. It is possible both interactively (fast) and
+by providing coordinates of the slice (repeatable).
 
-script to make faraday rotation maps
 
 @author: mikhail
 """
 
 import os
 #print(os.environ['HOME'])
+import logging
 
-
+import platform  # to get computer name in order to avoid selecting computer name and paths by hand
 import numpy as np
 import numpy.ma as ma
 import pandas as pd
@@ -41,14 +41,271 @@ from matplotlib.ticker import LinearLocator, NullFormatter, ScalarFormatter, For
 import matplotlib.patches as mpatches
 import matplotlib.ticker as ticker
 
+import datetime as dt
+
 #from scipy.cluster.hierarchy import dendrogram, linkage
-from scipy.ndimage import label, find_objects
+from scipy.ndimage import label, find_objects, gaussian_filter, mean
+from scipy import ndimage
 
 #from rm2lib import *
 from rm2lib import loglevs, limits_mas2pix, make_transform
 from deconvolve import make_beam
 
+def create_logger(obj=None, dest=['stderr'], levels=['INFO']):
+    """Creates a logger instance to write log information to STDERR.
+    
+    Args:
+        obj: caller object or function with a __name__ parameter
+        
+        dest (list, default is ['stderr']): a destination where to write 
+        logging information. Possible values: 'stderr', 'filename'. Every 
+        non-'stderr' string is treated as a filename
+            
+        levels (list, default is ['INFO']): logging levels. One value per dest 
+            is allowed. A single value will be applied to all dest. 
+    
+    Returns:
+        logging logger object
+    
+    Examples: 
+        a logger for a class: 
+            
+        logger = create_logger(obj=self) # create a logger 
+        logger.debug('debug message')
+        logger.info('info message')
+        logger.warning('warn message')
+        logger.error('error message')
+        logger.critical('critical message')
+        
+    """
+    
+    # initialize a named logger    
+    try:
+        logger = logging.getLogger(obj.__name__) # does not work yet. Do we need it at all? 
+    except:
+        logger = logging.getLogger('tsyslogger')
+    
+    # set the minimum logging level
+    logger.setLevel('DEBUG')
+    
+    
+    
+    # solve the issue of multiple handlers appearing unexpectedly
+    if (logger.hasHandlers()):
+        logger.handlers.clear()
+        logger.parent.handlers.clear()
+        
+    
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    
+    # match dimensions of dest and level
+    if isinstance(dest, list):
+        num_dest = len(dest)
+    else:
+        num_dest = 1
+        dest = [dest]
+    
+    if isinstance(levels, list):
+        num_levels = len(levels)
+    else:
+        num_levels = 1
+        levels = [levels]
+    
+    if num_dest > num_levels:
+        for i in np.arange(0, num_dest - num_levels):
+            levels.append(levels[-1])
+            
+    if num_dest < num_levels:
+        levels = levels[:len(num_dest)]
 
+    # add all desired destinations with proper levels
+    for i, d in enumerate(dest):
+        
+        if d.upper() in ['STDERR', 'ERR']:
+            handler = logging.StreamHandler()   # stderr
+        else:
+            handler = logging.FileHandler(d, mode='w') # file. w-write, a-append
+            
+        level = levels[i]
+        # set logging level
+        if level.upper() not in ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']:
+            original_level = level
+            level = 'INFO'
+            handler.setLevel(level)
+            handler.error('Logging level was not properly set ({}). Fall back to INFO.'.format(original_level))
+        else:
+            handler.setLevel(level.upper())
+        
+        
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+
+    return logger
+
+
+def average_rm_map(rms, rmes, logger=None):
+    """
+    Make average RM and RM_ERROR maps out of several RM maps and RM_ERROR maps.
+
+    Args:
+        rms ([[]]): 
+            list of RM maps as 2D numpy arrays
+        rmes ([[]]): 
+            list of RM_ERROR maps as 2D numpy arrays
+    
+    Returns:
+        rm:
+            average RM map as 2D numpy array
+        rme:
+            average RM_ERROR map as 2D numpy array
+
+    """
+    if logger:
+        logger.debug('Stacking RM maps:\n{}'.format(rms))
+        logger.debug('Stacking RM_ERROR maps:\n{}'.format(rmes))
+    
+    rm_stack = np.array(rms)
+    rme_stack = np.array(rmes)
+    
+    rm_stack[rm_stack < -4999.0] = np.nan
+    rme_stack[rme_stack < -4999.0] = np.nan
+    
+    if logger:
+        logger.debug('rm[0] dimensions are: {}'.format(rms[0].shape))
+        logger.debug('rm_stack dimensions are: {}'.format(rm_stack.shape))
+    
+    rm = np.nanmean(rm_stack, axis = 0)
+    rme = np.nanmean(rme_stack, axis = 0)
+    
+    np.nan_to_num(rm, copy=False, nan=-5000)
+    np.nan_to_num(rme, copy=False, nan=-5000)
+    
+
+    return rm, rme
+
+
+def average_contour_map(conts, logger=None):
+    """
+    Make average CONTOUR map out of several Stokes I
+
+    Args:
+        rms ([[]]): 
+            list of RM maps as 2D numpy arrays
+        rmes ([[]]): 
+            list of RM_ERROR maps as 2D numpy arrays
+    
+    Returns:
+        rm:
+            average RM map as 2D numpy array
+        rme:
+            average RM_ERROR map as 2D numpy array
+
+    """
+    if logger:
+        logger.debug('Stacking RM maps:\n{}'.format(conts))
+    
+    cont_stack = np.array(conts)
+    
+    if logger:
+        logger.debug('conts[0] dimensions are: {}'.format(conts[0].shape))
+        logger.debug('cont_stack dimensions are: {}'.format(cont_stack.shape))
+    
+    cont = np.nanmean(cont_stack, axis = 0)
+    
+    return cont
+
+
+def smooth_map(fits, factor=2.0, logger=None):
+    """Smooth a map with a Gaussian kernel. 
+    The size of the kernel is defined as a factor to the BMAJ, BMIN which are
+    already written in the FITS object.
+    
+    MAP = REAL_MAP * BEAM(BMAJ, BMIN)
+    SMOOTH_MAP = REAL_MAP * BEAM(BMAJ*factor, BMIN*factor)
+    
+    Given, that for convolution of two Gaussians f() and g() with FWHMs w_f and w_g 
+    respectively: FWHM(f*g) = sqrt(w_f**2 + w_g**2) . If f() - initial map and g() - convolving kernel,
+    then w_g = w_f * sqrt(factor**2 - 1)
+    
+    Args:
+        fits:
+            FITS object (data+header)
+        factor (float):
+            increase beam by this factor
+        logger:
+            logger to use
+            
+    
+    Returns:
+        smoothed fits map
+    """
+    header =fits[0].header
+    map2d = fits[0].data.squeeze()
+    param = get_parameters(header)
+    logger.info(param.columns)
+    
+    BMAJ = param.bmaj.values[0] / param.rapixsize.values[0]
+    BMIN = param.bmin.values[0] / param.rapixsize.values[0]
+    
+    # for simplicity, use round Gaussian with area = area_initial * (factor**2 - 1)
+    # => radius = sqrt(bmaj**2 + bmin**2) * sqrt(factor**2 - 1) 
+    kernel_r = np.sqrt(BMAJ**2 + BMIN**2) * np.sqrt(factor**2 - 1) 
+    logger.info('Initial map BMAJ = {} mas'.format(BMAJ))
+    logger.info('Smoothing with a kernel. FWHM = {} mas'.format(kernel_r))
+    logger.info(map2d.shape)
+    
+    smoothed_map = gaussian_filter(map2d, kernel_r)
+    
+    fits[0].data = smoothed_map[np.newaxis, np.newaxis, :]
+    logger.info(fits[0].header['BMAJ'])
+    
+    return fits
+    
+    
+    
+    
+    
+    
+def make_ridgeline(fits, steps=50, logger=None):
+    """Given a fits, make a ridgeline
+    
+    Args:
+        fits: FITS object (map + header)
+    
+    Returns:
+        ridge line (coordinates, value)
+    
+    """
+    
+    map2d = fits[0].data.squeeze()
+    header = fits[0].header
+    param = get_parameters(header)
+
+    #based on http://scipy-lectures.org/advanced/image_processing/auto_examples/plot_radial_mean.html#sphx-glr-advanced-image-processing-auto-examples-plot-radial-mean-py
+    
+    sx, sy = map2d.shape
+    X, Y = np.ogrid[0:sx, 0:sy]
+    r = np.hypot(X - sx/2, Y - sy/2) # hypotenuse, i.e. simply radius
+    rbin = (steps* r/r.max()).astype(np.int)
+    # radial_mean = ndimage.mean(map2d, labels=rbin, index=np.arange(1, rbin.max() +1))
+    radial_max = np.array(ndimage.maximum(map2d, labels=rbin, index=np.arange(1, rbin.max() +1)))
+    radial_max_pos = np.array(ndimage.maximum_position(map2d, labels=rbin, index=np.arange(1, rbin.max() +1))).T
+
+    # logger.info('radial_mean = {}'.format(radial_mean))
+    logger.info('radial_max = {}'.format(radial_max))
+    logger.info('radial_max_positions = {}'.format(radial_max_pos))
+
+    # ridgeline = np.append(radial_max_pos, radial_max)
+    ridgeline = np.concatenate([radial_max_pos, [radial_max]], axis=0).T
+    
+    logger.info('radial_max shape is {}'.format(radial_max.shape))
+    logger.info('radial_max_pos.T shape is {}'.format(radial_max_pos.shape))
+    
+    logger.info(ridgeline)
+    
+    return ridgeline
+    
+    
 
 
 def plot_rm_diff(rm1file,rm2file, contourfile = None, drm = 500, at = (0,0)):
@@ -728,54 +985,23 @@ def plot_pmap():
     
 
 
-def plot_rm(rmfile, contourfile, rmefile = None,  vlim = [-5000,5000], interactive = False, xlim = [4,-15], ylim = [4,-15], at = [0,0]):    
+def plot_rm(rmfile, contourfile, rmefile = None,  vlim = [-5000,5000], xlim = [4,-15], ylim = [4,-15], at = [0,0], interactive = False):    
     '''function to plot RM from a fits file onto a contour map.
     Should have an interactive regime to plot RM values along a slice or at a given point
     '''
     
-    print('IN PLOT_RM: at = {} {}'.format(at[0], at[1]))
-    
-    
-    # test
-    if 0:
-        # laptop
-        base = '/home/mikhail/sci/pol/final_effort'
-        basecont = '/home/mikhail/sci/pol'
-        
-#        # work PC
-#        base='/homes/mlisakov/data/S2087A/polar/final_effort'
-#        basecont = '/homes/mlisakov/data/S2087A/polar'
-        
-        rmfiles =       [base+'/3c273/frm.1226+023.x1-u1.2009_08_28.fits']
-        contourfiles =  [basecont+'/1226+023/maps/1226+023.U1.2009_08_28.ifits2']
-        contourfiles =  [basecont+'/1226+023/maps4rm/1226+023.X1.2009_08_28.mid.ifits']
-        
-        rmfile = rmfiles[0]
-        contourfile = contourfiles[0]
-        
-    
     s= re.search( 'c1-x2|x1-u1|u1-q1', rmfile)
     suffix=s.group(0)
-    
-#    print('\n'*30)
-#    print('suffix = {}'.format(suffix))    
-    
-    
     rm = read_fits(rmfile)
     cont = read_fits(contourfile)
-    
-    print('RM file = {}\nCONT file= {}'.format(rmfile, contourfile))
-    
-    
-    rmheader = rm[0].header
     
     try:
         rme = read_fits(rmefile)[0].data.squeeze()
     except:
-        rme = np.zeros(rm[0].data.squeeze())
+        rme = np.zeros(rm[0].data.squeeze().shape)
 
+    rmheader = rm[0].header
     contheader = cont[0].header
-    
     rmdf = get_parameters(rmheader)
     contdf = get_parameters(contheader)
 
@@ -809,8 +1035,87 @@ def plot_rm(rmfile, contourfile, rmefile = None,  vlim = [-5000,5000], interacti
                title = '{} on {} at {}'.format(rmdf.source.values[0], rmdf.dateobs.values[0], suffix.upper()))
     plot_contours(cont[0].data.squeeze(), cutoff = 0.1, fig=fig, ax=ax, colors = 'grey')
     
-    print('>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>RM value at ({},{}) = {}'.format(at[0], at[1], rm[0].data.squeeze()[-at[1], -at[0]]))
-    print('>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>RMerr value at ({},{}) = {}'.format(at[0], at[1], rme[-at[1], -at[0]]))
+    # print('>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>RM value at ({},{}) = {}'.format(at[0], at[1], rm[0].data.squeeze()[-at[1], -at[0]]))
+    # print('>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>RMerr value at ({},{}) = {}'.format(at[0], at[1], rme[-at[1], -at[0]]))
+
+    ax.plot(-at[0], -at[1], 'or')
+    
+    ax.coords[0].set_major_formatter('%.1f')
+    ax.coords[1].set_major_formatter('%.1f')
+    
+    
+    
+    return fig, ax
+    
+def plot_rm_fits(rm, cont, rme = None,  vlim = [-5000,5000], xlim = [4,-15], ylim = [4,-15], 
+                 at = [0,0], interactive = False,
+                 ridgeline=None):    
+    '''Plot RM from a FITS OBJECT onto a contour map.
+    
+    Args:
+        rm: FITS object with RM data
+        rme: FITS object with RM_ERROR data
+        cont: FITS object with Stokes I data
+        vlim ([float]): RM range in rad/m2
+        xlim ([float]): x range in mas
+        ylim ([float]): y range in mas
+        at ([float]): report RM values at this point  (mas)
+        interactive (bool): if True, draw slices with mouse. 
+        
+    Returns:
+         None   
+    
+    '''
+    suffix = 'mid'
+    
+    if rme == None:
+        rme = np.zeros(rm[0].data.squeeze().shape)
+
+    rmheader = rm[0].header
+    contheader = cont[0].header
+    rmdf = get_parameters(rmheader)
+    contdf = get_parameters(contheader)
+
+
+    # RM  
+#    PIXEL_PER_MAS = 3.6*10**6 
+#    
+#    wr = wcs.WCS(naxis=2)
+#    wr.wcs.crpix = [rmdf['racenpix'].values[0],rmdf['deccenpix'].values[0]+1]
+#    wr.wcs.cdelt = np.array([rmdf['rapixsize'].values[0] * PIXEL_PER_MAS, -rmdf['decpixsize'].values[0] * PIXEL_PER_MAS])  # note "-" in front of Y axis . Am I mixing axes???
+#    wr.wcs.crval = [0, 0]
+#    wr.wcs.ctype = ['RA', 'DEC']
+##    
+#    
+##    print('rm dataframe is:\n{}'.format(rmdf.iloc[0]))
+#    print('conr dataframe is:\n{}'.format(contdf.iloc[0]))
+
+#    wr = wcs.WCS(rmheader)
+#    wr = wr.celestial
+    wr = make_transform(rm)
+                 
+    
+    wc2 = wcs.WCS(contheader)
+    wc2 = wc2.celestial
+    
+    fig, ax = start_plot(cont, w=wr, xlim = xlim,  ylim = ylim)
+#    fig, ax = start_plot(cont, w=wr, xlim = [2,-7], ylim = [2,-7])
+#    fig, ax = start_plot(cont, w=wr)
+
+    plot_image(rm[0].data.squeeze(), cutoff = -4000,  vlim = vlim,  fig=fig, ax=ax, colorbar = True,
+               title = '{} on {} at {}'.format(rmdf.source.values[0], rmdf.dateobs.values[0], suffix.upper()))
+    plot_contours(cont[0].data.squeeze(), cutoff = 0.1, fig=fig, ax=ax, colors = 'grey')
+    
+    
+    if ridgeline is not None:
+        # plot ridgeline (x, y, value)
+        ax.plot(ridgeline[:,1] , ridgeline[:,0] , 'o') # note reversed order
+        
+    
+    
+    
+    # print('>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>RM value at ({},{}) = {}'.format(at[0], at[1], rm[0].data.squeeze()[-at[1], -at[0]]))
+    # print('>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>RMerr value at ({},{}) = {}'.format(at[0], at[1], rme[-at[1], -at[0]]))
 
     ax.plot(-at[0], -at[1], 'or')
     
@@ -822,6 +1127,7 @@ def plot_rm(rmfile, contourfile, rmefile = None,  vlim = [-5000,5000], interacti
     return fig, ax
     
 
+
 class ArrowBuilder:
     
     now_drawing = False
@@ -832,8 +1138,10 @@ class ArrowBuilder:
     epoch = ''
 
     
-    def __init__(self, line, ax, outslice = '/home/mikhail/tmp/slice.pkl', outbeam = '/home/mikhail/tmp/beam.pkl'):
-#    def __init__(self, line, ax, outslice = '/homes/mlisakov/tmp/slice.pkl', outbeam = '/homes/mlisakov/tmp/beam.pkl'):
+    # def __init__(self, line, ax, outslice = '/home/mikhail/tmp/slice.pkl', outbeam = '/home/mikhail/tmp/beam.pkl'):
+    def __init__(self, line, ax, outslice = '/homes/mlisakov/tmp/slice.pkl', 
+                 outbeam = '/homes/mlisakov/tmp/beam.pkl',
+                 rm=None, rme=None, cont=None):
         
         self.line = line
         self.ax = ax            # try to get axes inside the object
@@ -842,6 +1150,13 @@ class ArrowBuilder:
         self.cid = line.figure.canvas.mpl_connect('button_press_event', self)
         self.outslice = outslice
         self.outbeam  = outbeam
+        #provide data directly here as FITS objects
+        self.rm = rm
+        self.rme = rme
+        self.cont = cont
+        
+        
+        
 
     def from_coord(self, x1,y1, x2,y2 ):
         self.laststart = [x1,y1]
@@ -849,27 +1164,29 @@ class ArrowBuilder:
         
         print('laststart = {}'.format(self.laststart))
         
-        rmdata = read_fits(rmfile)[0].data.squeeze()
+        if self.rm is not None:
+            rmdata = self.rm[0].data.squeeze()
+            rmheader = self.rm[0].header
+            rmedata = self.rme[0].data.squeeze()
+            contdata = self.cont[0].data.squeeze()
+        else:
+            rmdata = read_fits(rmfile)[0].data.squeeze()
+            rmheader = read_fits(rmfile)[0].header
+            rmedata = read_fits(rmefile)[0].data.squeeze()
+            contdata = read_fits(contourfile)[0].data.squeeze()    
         
-        rmheader = read_fits(rmfile)[0].header
         self.source = rmheader['OBJECT']
         self.epoch = rmheader['DATE-OBS']
         
         
         
-        rmedata = read_fits(rmefile)[0].data.squeeze()
-        contdata = read_fits(contourfile)[0].data.squeeze()
+        
         rmdata2slice = np.copy(rmdata)      # same array as rmdata but with reverces indexes. Useful for taking proper slices since in imshow the image is reverted (i.e. origin = lower)
-        # test
-#            rmdata2slice = np.copy(contdata)      # same array as rmdata but with reverces indexes. Useful for taking proper slices since in imshow the image is reverted (i.e. origin = lower)
-        # test^^^
         rmedata2slice = np.copy(rmedata) # errors in RM
         self.proceed_slice(rmdata2slice, rmedata2slice = rmedata2slice)
         
         arrow = mpatches.Arrow(self.laststart[0], self.laststart[1], self.laststop[0] - self.laststart[0], self.laststop[1] - self.laststart[1], width=10)
         self.line.axes.add_patch(arrow)
-
-        
         
         return         
         
@@ -906,15 +1223,19 @@ class ArrowBuilder:
             self.coord = np.array([self.laststart, self.laststop]).astype(np.int).flatten()
             
             # get a rect region from an image 
-            rmdata = read_fits(rmfile)[0].data.squeeze()
-            rmedata = read_fits(rmefile)[0].data.squeeze()
-            contdata = read_fits(contourfile)[0].data.squeeze()
-            rmdata2slice = np.copy(rmdata)      # same array as rmdata but with reverces indexes. Useful for taking proper slices since in imshow the image is reverted (i.e. origin = lower)
-            rmedata2slice = np.copy(rmedata)      # same array as rmdata but with reverces indexes. Useful for taking proper slices since in imshow the image is reverted (i.e. origin = lower)
+            if self.rm is not None:
+                rmdata = self.rm[0].data.squeeze()
+                rmedata = self.rme[0].data.squeeze()
+                contdata = self.cont[0].data.squeeze()
+                rmdata2slice = np.copy(rmdata)      # same array as rmdata but with reverces indexes. Useful for taking proper slices since in imshow the image is reverted (i.e. origin = lower)
+                rmedata2slice = np.copy(rmedata)      # same array as rmdata but with reverces indexes. Useful for taking proper slices since in imshow the image is reverted (i.e. origin = lower)
+            else:
+                rmdata = read_fits(rmfile)[0].data.squeeze()
+                rmedata = read_fits(rmefile)[0].data.squeeze()
+                contdata = read_fits(contourfile)[0].data.squeeze()
+                rmdata2slice = np.copy(rmdata)      # same array as rmdata but with reverces indexes. Useful for taking proper slices since in imshow the image is reverted (i.e. origin = lower)
+                rmedata2slice = np.copy(rmedata)      # same array as rmdata but with reverces indexes. Useful for taking proper slices since in imshow the image is reverted (i.e. origin = lower)
             
-            # test
-#            rmdata2slice = np.copy(contdata)      # same array as rmdata but with reverces indexes. Useful for taking proper slices since in imshow the image is reverted (i.e. origin = lower)
-            # test^^^
             self.proceed_slice(rmdata2slice, rmedata2slice = rmedata2slice)
           
             
@@ -956,8 +1277,10 @@ class ArrowBuilder:
         diag_e = np.diag(res_e.squeeze())
         
         
-        
-        MASperPIX = np.abs(read_fits(rmfile)[0].header['CDELT1']*3.6e6)
+        if self.rm is not None:
+            MASperPIX = np.abs(self.rm[0].header['CDELT1']*3.6e6)
+        else:
+            MASperPIX = np.abs(read_fits(rmfile)[0].header['CDELT1']*3.6e6)
         print('IN the original image, there are {} mas per 1 pixel'.format(MASperPIX))
         L = np.sqrt(slice_rect.shape[0]**2 + slice_rect.shape[1]**2) * MASperPIX
         
@@ -986,8 +1309,8 @@ class ArrowBuilder:
         save_slice(self.d, filename=self.outslice)
         print('Saved slice to {}'.format(self.outslice))
         
-        self.bbb = save_beam(get_parameters(get_header(read_fits(contourfile))), self.slice_direction*180/np.pi, pixel_size = F , minimize_N = True, filename = self.outbeam)
-        print('Saved beam to {}'.format(self.outbeam))
+        # self.bbb = save_beam(get_parameters(get_header(read_fits(contourfile))), self.slice_direction*180/np.pi, pixel_size = F , minimize_N = True, filename = self.outbeam)
+        # print('Saved beam to {}'.format(self.outbeam))
         
         
         # PLOT SLICE in a separate window
@@ -1120,56 +1443,47 @@ def ellipse_projection(bmaj, bmin, bpa, phi, phi_coordinate_system='n2e'):
     
 def doit(rmfile,contourfile,vlim,xlim, ylim):
     '''plot RM figure to file'''
+    
+    print(rmfile)
+    
     fig,ax = plot_rm(rmfile=rmfile, contourfile=contourfile, vlim =vlim, xlim=xlim, ylim=ylim)
     filename = rmfile.replace('fits', 'pdf')
     plt.savefig(filename)
     print('saved RM figure to {}'.format(filename))
     return filename
 
-# ============================================================================================================================
-
-if __name__== "__main__":
+def make_filelist_etc(base=None, basecont=None, source='3C273', frequency_range='mid', logger=None):
+    """
+    Generate lists of RM map files, RM_error map files, Stokes I map files. 
+    All these files are used to plot a neat RM map.
     
-    base= os.getenv('RMDATA')
+    Args:
+        base (str): base path for RM map files
+        basecont (str): base path for Stokes I map files
+        source (str): source name, default '3C273'. Can be '3C279' also. Other to be added later.
+        frequency_range (str): frequency range to consider: low, mid, or hig. 
+    Returns:
+        rmfiles ([str]): list of RM map files
+        rmefiles ([str]): list of RM_error map files
+        contourfiles ([str]): list of Stokes I maps
+        vlim ([float]): RM values range in rad/m2
+        xlim ([float]): x range in mas
+        ylim ([float]): y range in mas
+    """
     
-    # laptop
-    base = '/home/mikhail/sci/pol/final_effort'
-    basecont = '/home/mikhail/sci/pol'
-    tmp =  '/home/mikhail/tmp'
-    plots = '/home/mikhail/sci/pol/plots'
+    rmfiles = rmefiles = contourfiles = vlim = xlim = ylim = []
     
-    # work PC
-#    base='/homes/mlisakov/data/S2087A/polar/final_effort'
-#    basecont = '/homes/mlisakov/data/S2087A/polar'
-#    tmp =  '/homes/mlisakov/tmp'
-#    plots = '/homes/mlisakov/data/S2087A/polar/plots'
-
-    print(base)    
-
-
-
-
-
-    source = '3c273'
-    source = '3c279'
-    frange = 'mid'
-    rmfiles = rmefiles = contourfiles = []
-
-    # 3C 273 
-    # low freq range
     if source == '3c273':
         if frange == 'low':
             vlim = [-1000,1000]
             xlim = [4,-20]
             ylim = [4,-20]
-            
             rmfiles= [
                     base+'/3c273/frm.1226+023.c1-x2.2009_08_28.fits', 
                     base+'/3c273/frm.1226+023.c1-x2.2009_10_25.fits',
                     base+'/3c273/frm.1226+023.c1-x2.2009_12_05.fits',
                     base+'/3c273/frm.1226+023.c1-x2.2010_01_26.fits'
                     ]
-            
             rmefiles= [
                     base+'/3c273/frme.1226+023.c1-x2.2009_08_28.fits', 
                     base+'/3c273/frme.1226+023.c1-x2.2009_10_25.fits',
@@ -1184,19 +1498,15 @@ if __name__== "__main__":
                     ]
 
         if frange == 'mid':
-        #    # 3C 273 
-        #    # mid freq range
             vlim = [-2000,1500]
             xlim = [4,-20]
             ylim = [4,-20]
-        
             rmfiles= [
                     base+'/3c273/frm.1226+023.x1-u1.2009_08_28.fits', 
                     base+'/3c273/frm.1226+023.x1-u1.2009_10_25.fits',
                     base+'/3c273/frm.1226+023.x1-u1.2009_12_05.fits',
                     base+'/3c273/frm.1226+023.x1-u1.2010_01_26.fits'
             ]
-            
             rmefiles= [
                     base+'/3c273/frme.1226+023.x1-u1.2009_08_28.fits', 
                     base+'/3c273/frme.1226+023.x1-u1.2009_10_25.fits',
@@ -1210,11 +1520,7 @@ if __name__== "__main__":
                     basecont+'/1226+023/maps4rm/1226+023.X1.2010_01_26.mid.ifits'
             ]
 
-
         if frange == 'hig':
-                    
-        ##    # 3C 273 
-        ##    # hig freq range
             vlim = [-4500,4500]
             xlim = [4,-10]
             ylim = [4,-10]
@@ -1224,14 +1530,12 @@ if __name__== "__main__":
                     base+'/3c273/frm.1226+023.u1-q1.2009_12_05.fits',
                     base+'/3c273/frm.1226+023.u1-q1.2010_01_26.fits'
                     ]
-        
             rmefiles= [
                     base+'/3c273/frme.1226+023.u1-q1.2009_08_28.fits', 
                     base+'/3c273/frme.1226+023.u1-q1.2009_10_25.fits',
                     base+'/3c273/frme.1226+023.u1-q1.2009_12_05.fits',
                     base+'/3c273/frme.1226+023.u1-q1.2010_01_26.fits'
                     ]
-        
             contourfiles=[
                     basecont+'/1226+023/maps4rm/1226+023.U1.2009_08_28.hig.ifits',
                     basecont+'/1226+023/maps4rm/1226+023.U1.2009_10_25.hig.ifits',
@@ -1239,19 +1543,16 @@ if __name__== "__main__":
                     basecont+'/1226+023/maps4rm/1226+023.U1.2010_01_26.hig.ifits'
                     ]
         
-
     if source == '3c279':
         if frange == 'low':
             vlim = [-250,250]
             xlim = [4,-10]
             ylim = [4,-10]
-
             rmfiles= [
                     base+'/3c279/frm.1253-055.c1-x2.2009_08_28.fits', 
                     base+'/3c279/frm.1253-055.c1-x2.2009_12_05.fits',
                     base+'/3c279/frm.1253-055.c1-x2.2010_01_26.fits'
                     ]
-            
             rmefiles= [
                     base+'/3c279/frme.1253-055.c1-x2.2009_08_28.fits', 
                     base+'/3c279/frme.1253-055.c1-x2.2009_12_05.fits',
@@ -1267,13 +1568,11 @@ if __name__== "__main__":
             vlim = [-800,800]
             xlim = [3,-7]
             ylim = [3,-7]
-
             rmfiles= [
                     base+'/3c279/frm.1253-055.x1-u1.2009_08_28.fits', 
                     base+'/3c279/frm.1253-055.x1-u1.2009_12_05.fits',
                     base+'/3c279/frm.1253-055.x1-u1.2010_01_26.fits'
                     ]
-            
             rmefiles= [
                     base+'/3c279/frme.1253-055.x1-u1.2009_08_28.fits', 
                     base+'/3c279/frme.1253-055.x1-u1.2009_12_05.fits',
@@ -1322,66 +1621,99 @@ if __name__== "__main__":
                     basecont+'/1253-055/maps4rm/1253-055.U1.2010_01_26.hig.ifits'
                     ]
 
+    return rmfiles, rmefiles, contourfiles, vlim, xlim, ylim
 
 
 
 
+
+# ============================================================================================================================
+
+if __name__== "__main__":
+    
+    logger = create_logger('rm', dest=['rm4.log', 'STDERR'], levels=['DEBUG', 'INFO'])
+    logger.info('Start working. Task 3C273 slices along the jet'.format(dt.datetime.now()))
+    
+    computer_name = platform.node()
+    logger.debug('Computer name is {}'.format(computer_name))
+    if computer_name == 'vlb098': # desktop 
+        base='/homes/mlisakov/data/S2087A/polar/final_effort'
+        basecont = '/homes/mlisakov/data/S2087A/polar'
+        tmp =  '/homes/mlisakov/tmp'
+        plots = '/homes/mlisakov/data/S2087A/polar/plots'
+    else: # laptop    
+        base = '/home/mikhail/sci/pol/final_effort'
+        basecont = '/home/mikhail/sci/pol'
+        tmp =  '/home/mikhail/tmp'
+        plots = '/home/mikhail/sci/pol/plots'
+    
+    source = '3c273'
+    frange = 'mid'
+
+    rmfiles, rmefiles, contourfiles, vlim, xlim, ylim = make_filelist_etc(base, basecont, source, frange)
+    logger.info('Made filelists for the source {} at {} frequency range'.format(source, frange))
+
+    rm_maps = list(map(lambda x: read_fits(x)[0].data.squeeze() ,rmfiles))
+    rme_maps = list(map(lambda x: read_fits(x)[0].data.squeeze() ,rmefiles))
+    cont_maps = list(map(lambda x: read_fits(x)[0].data.squeeze() ,contourfiles))
+
+    # average RM
+    average_rm_fits = read_fits(rmfiles[0]) # contains metadata. The data will be replaced with average
+    average_rme_fits = read_fits(rmfiles[0]) # contains metadata. The data will be replaced with average
+    average_cont_fits = read_fits(contourfiles[0]) # contains metadata. The data will be replaced with average
+    smooth_cont_fits = read_fits(contourfiles[0]) # contains metadata. The data will be replaced with average
+    # TODO: do it properly with astropy FITS objects
+    average_rm, average_rme = average_rm_map(rm_maps, rme_maps, logger=logger)
+    average_cont = average_contour_map(cont_maps, logger=logger)
+    average_rm_4axes = average_rm[np.newaxis, np.newaxis, :]
+    average_rme_4axes = average_rme[np.newaxis, np.newaxis, :]
+    average_cont_4axes = average_cont[np.newaxis, np.newaxis, :]
+    average_rm_fits[0].data = average_rm_4axes
+    average_rme_fits[0].data = average_rme_4axes
+    average_cont_fits[0].data = average_cont_4axes
+    smooth_cont_fits[0].data = average_cont_4axes
+
+    # smooth contours
+    smooth_cont_fits = smooth_map(smooth_cont_fits, factor=1.2, logger=logger)
+    ridgeline = make_ridgeline(smooth_cont_fits, logger=logger)    
+    
+    fig, ax = plot_rm_fits(average_rm_fits, average_cont_fits, average_rme_fits, 
+                 vlim=vlim, xlim=xlim, ylim=ylim, 
+                 interactive=True,
+                 ridgeline=ridgeline)
+    line, = ax.plot([0], [0])  # empty line
+    ab = ArrowBuilder(line,ax, outslice = tmp+'/slice_{}_mid.pkl'.format('avg'), 
+                      rm=average_rm_fits,
+                      rme=average_rme_fits,
+                      cont=average_cont_fits)
 
 
 
     # run one by one
-#    doit(rmfile,contourfile,vlim,xlim, ylim)
+    # doit(rmfile,contourfile,vlim,xlim, ylim)
     
-#    doit(base+'/3c273/frm.1226+023.c1-x2.2009_08_28.fits', basecont+'/1226+023/maps4rm/1226+023.C1.2009_08_28.low.ifits',[-800,800],  [4, -20],  [4, -20] )
+    # doit(rmfiles[0], contourfiles[0], [-800,800],  [4, -20],  [4, -20] )
 #    doit(base+'/3c273/frm.1226+023.c1-x2.2009_10_25.fits', basecont+'/1226+023/maps4rm/1226+023.C1.2009_10_25.low.ifits',[-800,800],  [4, -20],  [4, -20] )
 #    doit(base+'/3c273/frm.1226+023.c1-x2.2009_12_05.fits', basecont+'/1226+023/maps4rm/1226+023.C1.2009_12_05.low.ifits',[-800,800],  [4, -20],  [4, -20] )
 #    doit(base+'/3c273/frm.1226+023.c1-x2.2010_01_26.fits', basecont+'/1226+023/maps4rm/1226+023.C1.2010_01_26.low.ifits',[-800,800],  [4, -20],  [4, -20] )
-#    import sys
-#    sys.exit()
+    import sys
+    sys.exit()
 
 
     ab = ['a']*len(rmfiles)
     fig = ['a']*len(rmfiles)
     ax = ['a']*len(rmfiles)
     line = ['a']*len(rmfiles)
-
-
     xlims = [[],[]]
     ylims = [[],[]]
     
-
-
-
-
-    
-    
     for i,rmfile in enumerate(rmfiles): 
-        #vlim = [-1000,3500]
-#        vlim = [-600,600]
-        
-#        xlim = [2, -8]
-#        ylim = [2, -8]
-        
-#        xlim = [4,-20]
-#        ylim = [4,-20]
         
         contourfile = contourfiles[i]
         rmefile = rmefiles[i]
-        print(rmfile)
-        print(contourfiles[i])
-        if source == '3c273':
-            fig[i],ax[i] = plot_rm(rmfile=rmfile, contourfile=contourfiles[i], rmefile = rmefiles[i], vlim =vlim, xlim=xlim, ylim=ylim, at = [-530,-483])
-        if source == '3c279':
-            if frange == 'low':
-                fig[i],ax[i] = plot_rm(rmfile=rmfile, contourfile=contourfiles[i], rmefile = rmefiles[i], vlim =vlim, xlim=xlim, ylim=ylim, at = [ -541, -490])
-            if frange == 'mid':
-                fig[i],ax[i] = plot_rm(rmfile=rmfile, contourfile=contourfiles[i], rmefile = rmefiles[i], vlim =vlim, xlim=xlim, ylim=ylim, at = [ -565, -481])
+        fig[i],ax[i] = plot_rm(rmfile=rmfile, contourfile=contourfiles[i], rmefile = rmefiles[i], vlim =vlim, xlim=xlim, ylim=ylim, at = [-530,-483])
 
         line[i], = ax[i].plot([0], [0])  # empty line
-#        ab = ArrowBuilder(line,ax, outslice = tmp+'/slice_B_hig.pkl', outbeam = tmp+'/beam_B_hig.pkl')
-#        ab = ArrowBuilder(line,ax, outslice = tmp+'/slice_B_mid.pkl', outbeam = tmp+'/beam_B_mid.pkl')
-#        ab = ArrowBuilder(line,ax, outslice = tmp+'/slice_B_low.pkl', outbeam = tmp+'/beam_B_low.pkl')
-        
         ab[i] = ArrowBuilder(line[i],ax[i], outslice = tmp+'/slice_{}_mid.pkl'.format(i))
 #        print('slice coordinates:\n{:.0f}, {:.0f}, {:.0f}, {:.0f}'.format(ab[i].laststart[0], ab[i].laststart[1], ab[i].laststop[0], ab[i].laststop[1] ) )
 
@@ -1498,10 +1830,12 @@ if __name__== "__main__":
 #        axs.errorbar(np.arange(ab[i].diag_m.size), ab[i].diag_m, yerr = ab[i].diag_e, label = '{}'.format(ab[i].epoch), marker = markers[i])
         
         # mas-based plot
-        axs.errorbar(ab[i].d.length, ab[i].diag_m, yerr = ab[i].diag_e)
-        axs.xaxis.set_major_formatter(ticker.FormatStrFormatter('%.1f'))
-        axs.xaxis.set_minor_locator(AutoMinorLocator(5))
-        
+        try:
+            axs.errorbar(ab[i].d.length, ab[i].diag_m, yerr = ab[i].diag_e)
+            axs.xaxis.set_major_formatter(ticker.FormatStrFormatter('%.1f'))
+            axs.xaxis.set_minor_locator(AutoMinorLocator(5))
+        except AttributeError:
+            pass
         
         
 #        axs.set_xlim(0, self.diag_m.size)
@@ -1582,6 +1916,7 @@ if __name__== "__main__":
         figr, axr = plt.subplots(1,1)
     #    axr.plot(c, a)
         axr.errorbar(c, a , list(map(lambda x: x*1,ae)), color = 'blue', marker = 'o')
+
 
 
 
