@@ -51,6 +51,198 @@ from scipy import ndimage
 from rm2lib import loglevs, limits_mas2pix, make_transform
 from deconvolve import make_beam
 
+
+
+class ridgeline():
+    """Handles ridge lines.
+    Allows to find ridgeline coordinates from a map and apply these coordinates 
+    to get values from another map. Also allows different manipulations with the 
+    redgeline.
+    
+    Args:
+        ridgeline_fits:
+            astropy HDUList object with a map to build the ridgeline. Ridgeline is 
+            made in pixels and then converted to [mas] using FITS header info.
+        apply_to_fits:
+            astropy HDUList object to apply ridgeline to and get values. If nothing 
+            is supplied, ridgeline_fits is used. 
+        
+    Attributes:
+        rr:
+            ridgeline as a pandas dataframe. Important columns are: (x,y) - ridgeline
+            coordinates [mas], distance - distance along the ridgeline [mas],
+            (v, verr) - value and error, quality - boolean flag to use 
+            this particular point or not. 
+            
+    Methods:
+        TBA
+        
+    """
+    
+    
+    def __init__(self, ridgeline_fits=None, apply_to_fits=None):
+        """Initialize a ridgeline object. 
+        
+        Args:
+            ridgeline_fits:
+                astropy HDUList object with a map to build the ridgeline. Ridgeline is 
+                made in pixels and then converted to [mas] using FITS header info.
+            apply_to_fits:
+                astropy HDUList object to apply ridgeline to and get values. If nothing 
+                is supplied, ridgeline_fits is used. 
+        
+        """
+        self.logger = create_logger('ridgeline', dest=['STDERR'], levels=['INFO'])
+
+        # self.rr = pd.DataFrame(columns=['x', 'y', 'v', 'verr',  # ridgeline data + error
+        #                                'xminus', 'yminus',  # coordinates of the previous point. Can be rewritten in order not to use this
+        #                                'xplus', 'yplus',    # coordinates of the next point. Can be rewritten in order not to use this
+        #                                'a', 'b',            # fit line coefficients: y = ax + b
+        #                                'dir', 'perp',       # angle of the fit line and perpendicular one
+        #                                'xslice1', 'yslice1',# terminal point 1 of the cross slice
+        #                                'xslice2', 'yslice2',# terminal point 2 of the cross slice
+        #                                'distance',          # distance along the ridgeline
+        #                                'quality'])          # whether use this slice or not. Default True
+        self.rr = pd.DataFrame(columns=['x', 'y', 'v', 'verr',  # ridgeline data + error
+                                       'distance',          # distance along the ridgeline
+                                       'quality'])          # whether use this slice or not. Default True
+
+
+        
+
+
+
+    def make_ridgeline(self, ridgeline_fits, steps=50, smooth=True, smooth_factor=1.5):
+        """Get ridgeline coordinates given a map. Before making a ridgeline, the map
+        is smoothed with a Gaussian, see smooth_map for details. 
+        
+        Args:
+            ridgeline_fits:
+                astropy HDUList object with a map to build the ridgeline. Ridgeline is 
+                made in pixels and then converted to [mas] using FITS header info.
+
+        Returns:
+            radial_max_pos ([[float]]):
+                array with coordinates of the ridgeline in [pixels] ? (TODO: maybe change to mas? )
+                Also, self.rr.[x,y] are filled with coordinates in [mas]
+        """
+
+        # get pixel2mas convertion
+        param = get_parameters(ridgeline_fits[0].header)        
+        MASperPIX = np.abs(param.rapixsize.values[0]*3.6e6)
+            
+        #smooth map
+        if smooth is True:
+            ridgeline_fits = smooth_map(ridgeline_fits, factor=smooth_factor, logger=self.logger)
+        
+        
+        
+        map2d = ridgeline_fits[0].data.squeeze()
+        header = ridgeline_fits[0].header
+        param = get_parameters(header)
+    
+        #based on http://scipy-lectures.org/advanced/image_processing/auto_examples/plot_radial_mean.html#sphx-glr-advanced-image-processing-auto-examples-plot-radial-mean-py
+        
+        sx, sy = map2d.shape
+        X, Y = np.ogrid[0:sx, 0:sy]
+        r = np.hypot(X - sx/2, Y - sy/2) # hypotenuse, i.e. simply radius
+        rbin = (steps* r/r.max()).astype(np.int)
+        # radial_max = np.array(ndimage.maximum(map2d, labels=rbin, index=np.arange(1, rbin.max() +1)))
+        radial_max_pos = np.array(ndimage.maximum_position(map2d, labels=rbin, index=np.arange(1, rbin.max() +1)))
+        
+        
+        self.logger.debug('radial_max_pos = \n{}'.format(radial_max_pos))
+        
+        radial_max_pos = radial_max_pos[radial_max_pos[:, 0] > 0]
+        radial_max_pos = radial_max_pos[radial_max_pos[:, 1] > 0]
+        radial_max_pos = radial_max_pos[radial_max_pos[:, 0] < param.decmapsize.values[0]]
+        radial_max_pos = radial_max_pos[radial_max_pos[:, 1] < param.ramapsize.values[0]]
+        self.logger.debug('radial_max_pos = \n{}'.format(radial_max_pos))
+
+        
+        self.logger.info('MAKE: First 3 point of the ridgeline in pix: \n{}'.format(radial_max_pos[0:3, :]))
+        
+        self.rr.x = np.array( radial_max_pos[:, 1] - param.racenpix.values[0]) * MASperPIX
+        self.rr.y = np.array( radial_max_pos[:, 0] - param.deccenpix.values[0]) * MASperPIX
+        
+        return radial_max_pos
+    
+    def proceed_ridgeline(self):
+        """Calculate distance along the ridgeline.
+        Modifies self.rr inplace
+        
+        Args:
+            None
+        Returns:
+            None
+        """
+        
+        self.rr.loc[:, 'xminus'] = np.roll(self.rr.x, 1)
+        self.rr.loc[:, 'yminus'] = np.roll(self.rr.y, 1)
+        self.rr.loc[0, 'xminus'] = self.rr.loc[0, 'x']
+        self.rr.loc[0, 'yminus'] = self.rr.loc[0, 'y']
+        self.rr.loc[:, 'distance'] = np.sqrt((self.rr.x - self.rr.xminus)**2 + (self.rr.y - self.rr.yminus)**2) # distance to previous point 
+        
+        
+        self.logger.debug(self.rr.x)
+        # self.logger.debug(self.rr.xminus)
+        
+        
+        # remove points which are too far from the previous one
+        median_distance = self.rr.distance.median()
+        self.logger.info('Median distance between ridgeline points is {} mas'.format(median_distance))
+        
+        # self.logger.debug('rr.distance = {}'.format(self.rr.distance))
+        
+        self.rr.drop(self.rr.loc[self.rr.distance > 2 * median_distance].index, axis=0, inplace=True)
+        # self.logger.debug('BEFORE cumsum: rr.distance.index.size = {}'.format(self.rr.index.size))
+        self.rr.loc[:, 'distance'] = np.cumsum(self.rr.distance.values) # distance from the 0-th point along the ridgeline 
+        # self.logger.debug('AFTER cumsum: rr.distance.index.size = {}'.format(self.rr.index.size))
+    
+        # self.rr.loc[np.max(self.rr.index), 'quality'] = False
+        
+        
+        
+    
+    def apply_ridgeline(self, apply_to_fits):
+        """Take ridgeline coordinates and get map values at these points. 
+        Useful when e.g. making the ridgeline on a Stokes I map and then getting 
+        values from the RM map. Modifies self.rr[v, verr] inplace
+    
+        Args:
+            fits:
+                astropy HDUList object with the map
+            error:
+                astropy HDUList object with the error map
+            
+        Returns:
+            ridgeline as a dataframe
+        """
+
+        data_map = apply_to_fits[0].data.squeeze()
+        # get pixel2mas convertion
+        param = get_parameters(apply_to_fits[0].header)        
+        MASperPIX = np.abs(param.rapixsize.values[0]*3.6e6)
+        y = (self.rr.x.values / MASperPIX + param.racenpix.values[0]).astype(int)
+        x = (self.rr.y.values / MASperPIX + param.deccenpix.values[0]).astype(int)
+        
+        self.logger.info('APPLY: First 3 point of the ridgeline in pix: \n{}'.format(np.array([x[0:3],y[0:3]]).T))
+
+        self.rr.v = data_map[x, y]
+        
+        # if error is not None:
+        #     error_map = error[0].data.squeeze()
+        #     rr.verr = error_map[rr.x.values.astype(int), rr.y.values.astype(int)]
+    
+        return self.rr.loc[:, ['x', 'y', 'v']]
+    
+
+
+
+
+
+
+
 def create_logger(obj=None, dest=['stderr'], levels=['INFO']):
     """Creates a logger instance to write log information to STDERR.
     
@@ -127,7 +319,7 @@ def create_logger(obj=None, dest=['stderr'], levels=['INFO']):
             handler = logging.FileHandler(d, mode='w') # file. w-write, a-append
             
         level = levels[i]
-        # set logging level
+        # set logging leveridgelinel
         if level.upper() not in ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']:
             original_level = level
             level = 'INFO'
@@ -145,7 +337,23 @@ def create_logger(obj=None, dest=['stderr'], levels=['INFO']):
 
 def average_rm_map(rms, rmes, logger=None):
     """
-    Make average RM and RM_ERROR maps out of several RM maps and RM_ERROR maps.
+    Make average RM and R   
+        # self.rr.loc[]
+    
+    
+        # logger.debug('radial_max = {}'.format(radial_max))
+        # self.logger.debug('radial_max_positions[0].T - param.deccenpix.values[0] = {}'.format(radial_max_pos[1].T -param.racenpix.values[0] ))
+    
+            
+    
+    
+    # ridgeline = np.concatenate([radial_max_pos, [radial_max]], axis=0).T
+        
+        # logger.debug('radial_max shape is {}'.format(radial_max.shape))
+        # logger.debug('radial_max_pos.T shape is {}'.format(radial_max_pos.shape))
+        
+        # logger.info('\n{}'.format(ridgeline[:3]))
+        M_ERROR maps out of several RM maps and RM_ERROR maps.
 
     Args:
         rms ([[]]): 
@@ -186,7 +394,7 @@ def average_rm_map(rms, rmes, logger=None):
 
 def average_contour_map(conts, logger=None):
     """
-    Make average CONTOUR map out of several Stokes I
+    Make average CONTOUR map out oridgelinef several Stokes I
 
     Args:
         rms ([[]]): 
@@ -242,7 +450,8 @@ def smooth_map(fits, factor=2.0, logger=None):
     header =fits[0].header
     map2d = fits[0].data.squeeze()
     param = get_parameters(header)
-    logger.info(param.columns)
+    if logger:
+        logger.info(param.columns)
     
     BMAJ = param.bmaj.values[0] / param.rapixsize.values[0]
     BMIN = param.bmin.values[0] / param.rapixsize.values[0]
@@ -250,14 +459,16 @@ def smooth_map(fits, factor=2.0, logger=None):
     # for simplicity, use round Gaussian with area = area_initial * (factor**2 - 1)
     # => radius = sqrt(bmaj**2 + bmin**2) * sqrt(factor**2 - 1) 
     kernel_r = np.sqrt(BMAJ**2 + BMIN**2) * np.sqrt(factor**2 - 1) 
-    logger.info('Initial map BMAJ = {} mas'.format(BMAJ))
-    logger.info('Smoothing with a kernel. FWHM = {} mas'.format(kernel_r))
-    logger.info(map2d.shape)
+    if logger:
+        logger.info('Initial map BMAJ = {} mas'.format(BMAJ))
+        logger.info('Smoothing with a kernel. FWHM = {} mas'.format(kernel_r))
+        logger.info(map2d.shape)
     
     smoothed_map = gaussian_filter(map2d, kernel_r)
     
     fits[0].data = smoothed_map[np.newaxis, np.newaxis, :]
-    logger.info(fits[0].header['BMAJ'])
+    if logger:
+        logger.info(fits[0].header['BMAJ'])
     
     return fits
     
@@ -266,20 +477,27 @@ def smooth_map(fits, factor=2.0, logger=None):
     
     
     
-def make_ridgeline(fits, steps=50, logger=None):
+def make_ridgeline(fits, steps=50, logger=None, smooth=False, smooth_factor=1.5):
     """Given a fits, make a ridgeline
     
     Args:
         fits: FITS object (map + header)
     
     Returns:
-        ridge line (coordinates, value)
+        ridge line (coordinates[pix,pix], value)
     
     """
+    #smooth map
+    if smooth is True:
+        fits = smooth_map(fits, factor=smooth_factor, logger=logger)
+    
+    
     
     map2d = fits[0].data.squeeze()
     header = fits[0].header
     param = get_parameters(header)
+    
+    
 
     #based on http://scipy-lectures.org/advanced/image_processing/auto_examples/plot_radial_mean.html#sphx-glr-advanced-image-processing-auto-examples-plot-radial-mean-py
     
@@ -301,10 +519,112 @@ def make_ridgeline(fits, steps=50, logger=None):
     logger.info('radial_max shape is {}'.format(radial_max.shape))
     logger.info('radial_max_pos.T shape is {}'.format(radial_max_pos.shape))
     
-    logger.info(ridgeline)
+    # np.set_printoptions(precision=2)
+    logger.info('\n{}'.format(ridgeline[:3]))
     
     return ridgeline
+
+
+def proceed_ridgeline(ridgeline, radius=20, npoints=np.inf):
+    """For each ridgeline point, calculates 
+    - local ridgeline direction (as a 3-point fit)
+    - local perpendicular direction
+    - coordinates of slice start and stop [pix]
     
+    Args:
+        ridgeline: 
+            ridgeline array as returned by make_ridgeline
+        radius (float):
+            slice half-length [pix]
+    
+    Returns:
+        rich ridgeline
+    """
+    rr = rich_ridgeline = pd.DataFrame(columns=['x', 'y', 'v', 'verr',  # ridgeline data + error
+                                           'xminus', 'yminus',  # coordinates of the previous point. Can be rewritten in order not to use this
+                                           'xplus', 'yplus',    # coordinates of the next point. Can be rewritten in order not to use this
+                                           'a', 'b',            # fit line coefficients: y = ax + b
+                                           'dir', 'perp',       # angle of the fit line and perpendicular one
+                                           'xslice1', 'yslice1',# terminal point 1 of the cross slice
+                                           'xslice2', 'yslice2',# terminal point 2 of the cross slice
+                                           'distance',          # distance along the ridgeline
+                                           'quality'])          # whether use this slice or not. Default True
+    rr.x = ridgeline.T[0]    # current point
+    rr.y = ridgeline.T[1]
+    rr.v = ridgeline.T[2]
+    rr.xminus = np.roll(rr.x, 1)    # previous point
+    rr.yminus = np.roll(rr.y, 1)
+    rr.xplus = np.roll(rr.x, -1)      # next point
+    rr.yplus = np.roll(rr.y, -1)
+    rr.quality = True
+    
+    rr.loc[:, 'distance'] = np.sqrt((rr.x - rr.xminus)**2 + (rr.y - rr.yminus)**2) # distance to previous point 
+    rr.loc[0, 'distance'] = 0.0
+    rr.loc[:, 'distance'] = np.cumsum(rr.distance) # distance from the 0-th point along the ridgeline 
+    
+    for i in rr.index:
+        a, b = np.polyfit(list(rr.loc[i, ['xminus', 'x', 'xplus']].values),
+                          list(rr.loc[i, ['yminus', 'y', 'yplus']].values),
+                          1)
+        
+        rr.loc[i, ['a', 'b', 'dir']] = [a, b, np.arctan(a)]
+        
+        x = rr.loc[i, 'x']
+        y = rr.loc[i, 'y']
+        r = radius
+        a_perp = np.tan(np.arctan(a) + np.pi / 2)
+        b_perp = y - a_perp * x
+        a = a_perp
+        b = b_perp
+        
+        # wolfram
+        D = (a**2 + 1)*r**2 + 2*b*(y-a*x) - (y-a*x)**2 - b**2
+        x1 = ((a*y+x-a*b) + np.sqrt(D)) / (a**2 + 1)
+        x2 = ((a*y+x-a*b) - np.sqrt(D)) / (a**2 + 1)
+        
+        rr.loc[i, 'xslice1'] = x1
+        rr.loc[i, 'xslice2'] = x2 # maybe swap x1 and x2
+        rr.loc[i, 'yslice1'] = a * x1 + b
+        rr.loc[i, 'yslice2'] = a * x2 + b
+        
+        
+    rr.loc[:, 'perp'] = rr.loc[:, 'dir'] + np.pi / 2
+    rr.loc[rr.perp < -np.pi / 2, 'perp'] += np.pi 
+    rr.loc[rr.perp > np.pi / 2, 'perp'] -= np.pi 
+    
+    
+    rr.loc[0, 'quality'] = False
+    rr.loc[np.max(rr.index), 'quality'] = False
+    
+    rr.drop(rr.loc[rr.index > npoints].index, axis=0, inplace=True)
+    return(rr)
+
+
+def apply_ridgeline(fits, rr, error=None):
+    """Take ridgeline coordinates and get map values at these points. 
+    Useful when e.g. making the ridgeline on a Stokes I map and then getting 
+    values from the RM map. 
+    
+    Args:
+        fits:
+            astropy fits object with the map
+        rr:
+            ridgeline in the form of a DataFrame
+        error:
+            astropy fits object with the error map
+        
+    Returns:
+        ridgeline
+    """
+
+    data_map = fits[0].data.squeeze()
+    rr.v = data_map[rr.x.values.astype(int), rr.y.values.astype(int)]
+    
+    if error is not None:
+        error_map = error[0].data.squeeze()
+        rr.verr = error_map[rr.x.values.astype(int), rr.y.values.astype(int)]
+
+    return rr
     
 
 
@@ -1049,7 +1369,8 @@ def plot_rm(rmfile, contourfile, rmefile = None,  vlim = [-5000,5000], xlim = [4
     
 def plot_rm_fits(rm, cont, rme = None,  vlim = [-5000,5000], xlim = [4,-15], ylim = [4,-15], 
                  at = [0,0], interactive = False,
-                 ridgeline=None):    
+                 ridgeline=None,
+                 ridgeline_new=None):    
     '''Plot RM from a FITS OBJECT onto a contour map.
     
     Args:
@@ -1111,6 +1432,11 @@ def plot_rm_fits(rm, cont, rme = None,  vlim = [-5000,5000], xlim = [4,-15], yli
         # plot ridgeline (x, y, value)
         ax.plot(ridgeline[:,1] , ridgeline[:,0] , 'o') # note reversed order
         
+    
+    if ridgeline_new is not None:
+        ax.plot(ridgeline_new[:,1] , ridgeline_new[:,0] , 'o') # note reversed order
+
+    
     
     
     
@@ -1664,6 +1990,8 @@ if __name__== "__main__":
     smooth_cont_fits = read_fits(contourfiles[0]) # contains metadata. The data will be replaced with average
     # TODO: do it properly with astropy FITS objects
     average_rm, average_rme = average_rm_map(rm_maps, rme_maps, logger=logger)
+    average_rm[average_rm < -4999.0]=np.nan
+    
     average_cont = average_contour_map(cont_maps, logger=logger)
     average_rm_4axes = average_rm[np.newaxis, np.newaxis, :]
     average_rme_4axes = average_rme[np.newaxis, np.newaxis, :]
@@ -1674,250 +2002,41 @@ if __name__== "__main__":
     smooth_cont_fits[0].data = average_cont_4axes
 
     # smooth contours
-    smooth_cont_fits = smooth_map(smooth_cont_fits, factor=1.2, logger=logger)
-    ridgeline = make_ridgeline(smooth_cont_fits, logger=logger)    
+    # smooth_cont_fits = smooth_map(smooth_cont_fits, factor=1.2, logger=logger)
     
+# new method
+    rr = ridgeline()
+    rad_max_pos = rr.make_ridgeline(smooth_cont_fits)
+    rr.proceed_ridgeline()
+    rm_ridgeline = rr.apply_ridgeline(average_rm_fits).values
+
     fig, ax = plot_rm_fits(average_rm_fits, average_cont_fits, average_rme_fits, 
-                 vlim=vlim, xlim=xlim, ylim=ylim, 
-                 interactive=True,
-                 ridgeline=ridgeline)
-    line, = ax.plot([0], [0])  # empty line
-    ab = ArrowBuilder(line,ax, outslice = tmp+'/slice_{}_mid.pkl'.format('avg'), 
-                      rm=average_rm_fits,
-                      rme=average_rme_fits,
-                      cont=average_cont_fits)
+                  vlim=vlim, xlim=xlim, ylim=ylim, 
+                  interactive=False,
+                  ridgeline_new=rm_ridgeline)
 
 
 
-    # run one by one
-    # doit(rmfile,contourfile,vlim,xlim, ylim)
-    
-    # doit(rmfiles[0], contourfiles[0], [-800,800],  [4, -20],  [4, -20] )
-#    doit(base+'/3c273/frm.1226+023.c1-x2.2009_10_25.fits', basecont+'/1226+023/maps4rm/1226+023.C1.2009_10_25.low.ifits',[-800,800],  [4, -20],  [4, -20] )
-#    doit(base+'/3c273/frm.1226+023.c1-x2.2009_12_05.fits', basecont+'/1226+023/maps4rm/1226+023.C1.2009_12_05.low.ifits',[-800,800],  [4, -20],  [4, -20] )
-#    doit(base+'/3c273/frm.1226+023.c1-x2.2010_01_26.fits', basecont+'/1226+023/maps4rm/1226+023.C1.2010_01_26.low.ifits',[-800,800],  [4, -20],  [4, -20] )
-    import sys
-    sys.exit()
 
+# old method (to compare against)
+    ridgeline_old = make_ridgeline(smooth_cont_fits, logger=logger, smooth=True, smooth_factor=1.2)    
+    rr_old = proceed_ridgeline(ridgeline_old, radius=50, npoints=30)
+    rr_old = apply_ridgeline(average_rm_fits, rr_old)
+    ridgeline_old =  rr_old.loc[:, ['x', 'y', 'v']].values
 
-    ab = ['a']*len(rmfiles)
-    fig = ['a']*len(rmfiles)
-    ax = ['a']*len(rmfiles)
-    line = ['a']*len(rmfiles)
-    xlims = [[],[]]
-    ylims = [[],[]]
-    
-    for i,rmfile in enumerate(rmfiles): 
-        
-        contourfile = contourfiles[i]
-        rmefile = rmefiles[i]
-        fig[i],ax[i] = plot_rm(rmfile=rmfile, contourfile=contourfiles[i], rmefile = rmefiles[i], vlim =vlim, xlim=xlim, ylim=ylim, at = [-530,-483])
-
-        line[i], = ax[i].plot([0], [0])  # empty line
-        ab[i] = ArrowBuilder(line[i],ax[i], outslice = tmp+'/slice_{}_mid.pkl'.format(i))
-#        print('slice coordinates:\n{:.0f}, {:.0f}, {:.0f}, {:.0f}'.format(ab[i].laststart[0], ab[i].laststart[1], ab[i].laststop[0], ab[i].laststop[1] ) )
-
-
-        
-        if source == '3c273':
-            # Manually edited below. The essential slices to show.
-            # 3C 273. Slices across the jet at C1-X2 that shows no significant evolution of RM values 
-    #        ab[i].from_coord(595, 416, 639, 471) # [6] <- even farther from the core
-    #        ab[i].from_coord(574, 424, 622, 488) # [5] <- farther from the core
-    #        ab[i].from_coord(561, 435, 606, 501) # [4] REFERENCE SLICE
-    #        ab[i].from_coord(540, 449, 582, 517) # [3] <- closer to the core
-    #        ab[i].from_coord(526, 460, 565, 523) # [2] <- even closer
-    #        ab[i].from_coord(511, 470, 547, 529) # [1] <-even closer  : slight difference between A and B at the southern part of the jet, while E has these values blanked (not a good lambda^2 fit? )
-    
-            # 3C 273. A slice across the jet at X1-U1 that shows no significant evolution of RM values 
-    #        ab[i].from_coord(595, 416, 639, 471) # [6] <- even farther from the core
-    #        ab[i].from_coord(574, 424, 622, 488) # [5] <- farther from the core
-    #        ab[i].from_coord(561, 435, 606, 501) # [4] REFERENCE SLICE
-    #        ab[i].from_coord(540, 449, 582, 517) # [3] <- closer to the core
-    #        ab[i].from_coord(520, 453, 564, 520) # [2] <- even closer
-    #        ab[i].from_coord(511, 470, 547, 529) # [1] <-even closer
-            
-            # 3C 273. Slices across the jet at U1-Q1  (slices are different from those at low and mid). 
-    #        ab[i].from_coord(506, 448, 570, 519 )  # [1] <- closer to the core
-    #        ab[i].from_coord(513, 440, 576, 501 ) # [2] <- farther downstream
-    #        ab[i].from_coord(521, 432, 580, 490 ) # [3] <- even farther downstream
-    #        ab[i].from_coord(530, 424, 586, 484 ) # [4] <- even farther downstream
-    #        ab[i].from_coord(536, 415, 591, 480 ) # [5] <- even farther downstream
-    #        ab[i].from_coord(545, 408, 601, 470 ) # [6] <- even farther downstream
-    #        ab[i].from_coord(550, 400, 603, 459 ) # [7] <- even farther downstream
-    #        ab[i].from_coord(556, 392, 605, 450 ) # [8] <- even farther downstream
-             
-    #        ab[i].from_coord(515, 466, 546, 499)  # [9] <- a slice crossing the point (-530,-483) with high RM variations
-    
-        
-        
-        
-            # 3C 273. Slices ALONG the jet at C1-X2
-    #        ab[i].from_coord(510, 511, 594, 406) # [1] <- same as [1] at hig
-    #        ab[i].from_coord(503, 515, 705, 370) # [2] <- a long slice along the jet
-        
-        
-            # 3C 273. Slices ALONG the jet at X1-U1
-    #        ab[i].from_coord(510, 511, 594, 406) # [1] <- same as [1] at hig
-#            ab[i].from_coord(503, 515, 705, 370) # [2] <- a long slice along the jet
+    fig, ax = plot_rm_fits(average_rm_fits, average_cont_fits, average_rme_fits, 
+                  vlim=vlim, xlim=xlim, ylim=ylim, 
+                  interactive=False,
+                  ridgeline=ridgeline_old)
+    # line, = ax.plot([0], [0])  # empty line
+    # ab = ArrowBuilder(line,ax, outslice = tmp+'/slice_{}_mid.pkl'.format('avg'), 
+    #                   rm=average_rm_fits,
+    #                   rme=average_rme_fits,
+    #                   cont=average_cont_fits)
     
     
-            # 3C 273. Slices ALONG the jet at U1-Q1
-    #        ab[i].from_coord(510, 511, 594, 406) # [1] <- reference slice, approx in the middle of RM structure
-    #        ab[i].from_coord(506, 488, 585, 389) # [2] <- to the south from the ref slice
-    #        ab[i].from_coord(509, 475, 566, 470) # [3] <- inclined slice starting at a negative feature that is visible in epoch B
-        
-            pass
-    
-        if source == '3c279':
-            if frange == 'low':
-                # 3C 279. Slices across the jet at C1-X2
-#                ab[i].from_coord( 500, 483, 531, 526 ) # [1] <- ref slice
-    #            ab[i].from_coord( 506, 474, 541, 521 ) # [2] <- further downstream
-    #            ab[i].from_coord( 516, 472, 553, 518 ) # [3]  <- further downstream
-    #            ab[i].from_coord( 523, 463, 569, 510 ) # [4]  <- further downstream
-    #            ab[i].from_coord( 530, 452, 578, 501 ) # [5]  <- further downstream
-#                ab[i].from_coord( 541, 440, 589, 488 ) # [6]  <- further downstream
-    
-    
-                # 3C 279. Slices ALONG the jet at C1-X2
-                ab[i].from_coord(497, 510, 525, 508)    # [1] <- perpendicular to the dip line
-#                ab[i].from_coord(494, 524, 575, 465)    # [2] <- long cut, middle of the jet
-#                ab[i].from_coord(490, 516, 574, 452)    # [3] <- long cut, to the south of [2]
-#                ab[i].from_coord(499, 534, 580, 475)    # [4] <- long cut, to the north of [2]
-                pass
-    
-        
-            if frange == 'mid':
-                # 3C 279. Slices across the jet at X1-U1
-#                ab[i].from_coord( 490, 489, 522, 542 ) # [1] <- ref slice
-#                ab[i].from_coord( 500, 479, 532, 527 ) # [2] <- further downstream
-#                ab[i].from_coord( 509, 473, 541, 514 ) # [3]  <- further downstream
-#                ab[i].from_coord( 528, 464, 553, 508 ) # [4]  <- further downstream
-#                ab[i].from_coord( 545, 449, 572, 504 ) # [5]  <- further downstream
-#                ab[i].from_coord( 561, 427, 590, 490 ) # [6]  <- further downstream
-#                ab[i].from_coord( 574, 412, 608, 475 ) # [7]  <- further downstream
-#                ab[i].from_coord( 588, 401, 622, 460 ) # [8]  <- further downstream
-                
-                
-                # 3C 279. Slices ALONG the jet at X1-U1
-                ab[i].from_coord(493, 523, 613, 429)  # [1] <- a slice through the whole jet length
-#                ab[i].from_coord(491, 508, 548, 467) # [2] <- a short slice of the southern edge wrt [3]
-#                ab[i].from_coord(492, 522, 548, 482) # [3] <- a refernce short slice in the midlle line of the jet
-#                ab[i].from_coord(497, 533, 547, 496) # [4] <- a short slice of the northern edge wrt [3]
-                
-                pass
-            
-            
-            
-            
-            pass
-    
-    
-    
-#    line, = ax.plot([0], [0])  # empty line
-#    ab = ArrowBuilder(line)
-
-
-
-
-
-    # plot all slices alltogether in one figure
-    figs, axs = plt.subplots(1,1)
-    figs.suptitle(ab[0].source)
-    markers = ['o', 'v', 's', '*']
-    for i,rmfile in enumerate(rmfiles): 
-#        axs.errorbar(np.arange(ab[i].diag_m.size), ab[i].diag_m, yerr = ab[i].diag_e, label = '{}'.format(ab[i].epoch), marker = markers[i])
-        
-        # mas-based plot
-        try:
-            axs.errorbar(ab[i].d.length, ab[i].diag_m, yerr = ab[i].diag_e)
-            axs.xaxis.set_major_formatter(ticker.FormatStrFormatter('%.1f'))
-            axs.xaxis.set_minor_locator(AutoMinorLocator(5))
-        except AttributeError:
-            pass
-        
-        
-#        axs.set_xlim(0, self.diag_m.size)
-#        axs.set_ylim(vlim[0], vlim[1])
-
-    figs.legend()
-
-
-    # RM difference 
-    # 3C 273    
-    if source == '3c273':
-        r1= plot_rm_diff(rmfiles[1], rmfiles[0], contourfile = contourfiles[0], drm = 1000 )
-        r2= plot_rm_diff(rmfiles[2], rmfiles[1], contourfile = contourfiles[0], drm = 1000 )
-        r3= plot_rm_diff(rmfiles[3], rmfiles[2], contourfile = contourfiles[0], drm = 1000 )
-        
-    #    r= plot_rm_diff(rmfiles[3], rmfiles[1], contourfile = contourfiles[0], drm = 700 )
-    
-    #    r= plot_rm_diff(rmfiles[3], rmfiles[0], contourfile = contourfiles[0], drm = 10000 )
-    #    r= plot_rm_diff(rmfiles[2], rmfiles[0], contourfile = contourfiles[0], drm = 10000 )
-        print('The median difference between B and A is: {:.0f}'.format(np.nanmedian(r1[0].data.squeeze())))
-        print('The median difference between C and B is: {:.0f}'.format(np.nanmedian(r2[0].data.squeeze())))
-        print('The median difference between E and C is: {:.0f}'.format(np.nanmedian(r3[0].data.squeeze())))
-    
-    
-    
-        # plot RM changes at at = -530 -483 for hig freq range
-        a = [1920.62109375, -2403.939453125, -1419.633544921875,2013.0157470703125]     # RM values
-        ae = [ 405.8110046386719, 407.8999938964844, 392.44207763671875,534.901489257812   ] # RM errors
-        b = ['2009-08-28', '2009-10-25' , '2009-12-05', '2010-01-26']  # dates
-        c=[0]*len(b)
-        from datetime import datetime
-        for i,bb in enumerate(b):
-            t = datetime.strptime(bb,'%Y-%m-%d')
-            tt = t.timetuple()
-            c[i] = tt.tm_year + tt.tm_yday/365
-    
-        figr, axr = plt.subplots(1,1)
-    #    axr.plot(c, a)
-        axr.errorbar(c, a , list(map(lambda x: x*1,ae)), color = 'blue', marker = 'o')
-
-
-
-
-    if source == '3c279':
-        drm =1000
-        b = ['2009-08-28', '2009-12-05', '2010-01-26']  # dates
-        c=[0]*len(b)
-        from datetime import datetime
-        for i,bb in enumerate(b):
-            t = datetime.strptime(bb,'%Y-%m-%d')
-            tt = t.timetuple()
-            c[i] = tt.tm_year + tt.tm_yday/365
-        
-        
-        if frange == 'low':
-            drm = 250
-            r1= plot_rm_diff(rmfiles[1], rmfiles[0], contourfile = contourfiles[0], drm = drm )
-            r2= plot_rm_diff(rmfiles[2], rmfiles[1], contourfile = contourfiles[0], drm = drm )
-            print('The median difference between C and A is: {:.0f}'.format(np.nanmedian(r1[0].data.squeeze())))
-            print('The median difference between E and C is: {:.0f}'.format(np.nanmedian(r2[0].data.squeeze())))
-            # plot RM changes at at =  -554, -495 for low freq range
-            a = [  145.615  ,   16.48  ,   -181.9  ]     # RM values
-            ae = [ 33.97   ,  35.1   , 44.6    ] # RM errors
-     
-        if frange =='mid':
-            drm = 1000
-            r1= plot_rm_diff(rmfiles[1], rmfiles[0], contourfile = contourfiles[0], drm = drm )
-            r2= plot_rm_diff(rmfiles[2], rmfiles[1], contourfile = contourfiles[0], drm = drm )
-            print('The median difference between C and A is: {:.0f}'.format(np.nanmedian(r1[0].data.squeeze())))
-            print('The median difference between E and C is: {:.0f}'.format(np.nanmedian(r2[0].data.squeeze())))
-            # plot RM changes at at =  -565, -481 for low freq range
-            a = [  -139  ,  -93  ,  565 ]     # RM values
-            ae = [  125 ,  122 ,   186  ] # RM errors
-
-        
-        
-    
-        figr, axr = plt.subplots(1,1)
-    #    axr.plot(c, a)
-        axr.errorbar(c, a , list(map(lambda x: x*1,ae)), color = 'blue', marker = 'o')
-
-
-
-
-
+    # figr, axr = plt.subplots(1,1)
+    # axr.plot(rr.distance, rr.v, '-o') # should be distance along the ridge line, not radius
+    # # axr.set_yscale('log')
+    # axr.set_xlabel('Distance along the ridge line [pix]')
+    # axr.set_ylabel('Pixel intensity [Jy/beam?]')
