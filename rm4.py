@@ -56,10 +56,120 @@ import datetime as dt
 #from scipy.cluster.hierarchy import dendrogram, linkage
 from scipy.ndimage import label, find_objects, gaussian_filter, mean
 from scipy import ndimage
+from scipy.optimize import curve_fit
 
 #from rm2lib import *
 from rm2lib import loglevs, limits_mas2pix, make_transform, corner_std
 from deconvolve import make_beam
+
+
+class Model():
+    """Handles modelfit models. 
+    
+    clean models are not handled for now but could be added later. 
+    """
+    
+    def __init__(self):
+        """Initialize a model
+        
+        Attributes:
+            data: 
+                pandas DataFrame containing the model itself. Columns= 
+                [flux, radius, theta, major, axratio, phi, freq, spix]
+                All columns ending with v are boolean flags if the parameter is variable
+                (True) or not (False).
+                (x,y) - raduis and theta converted to ra and dec offsets from the image center.
+                Index = comp number.
+            
+            origin ([float]):
+                coordinates of the origin of the model [mas, mas]. If the model is shifted,
+                the origin is changed accordingly.
+        """
+        
+        
+        self.data = pd.DataFrame(columns=['flux', 'fluxv', 
+                                          'radius', 'radiusv',
+                                          'theta', 'thetav',
+                                          'x', 'y',
+                                          'major', 'majorv',
+                                          'axratio', 'axratiov',
+                                          'phi', 'phiv',
+                                          'T', 'freq', 'spix'])
+        
+        self.origin = np.array([0.0, 0.0])
+
+
+    def read_model(self, file):
+        """Read model from file
+        
+        Args:
+            file:
+                file with a model
+        
+        Returns:
+            self.data:
+                Dataframe with the model
+        """
+        
+        self.data = pd.read_csv(file, names=['flux', 'radius', 'theta', 'major',
+                                             'axratio', 'phi', 'T', 'freq', 'spix'],
+                                index_col=False, sep='\s+',
+                                comment='!')
+        
+        # set flags
+        for col in ['flux', 'radius', 'theta', 'major', 'axratio', 'phi']:
+            self.data.loc[:, col] = self.data.loc[:, col].astype(str)
+            self.data.loc[:, '{}v'.format(col)] = self.data.loc[:, col].str.endswith('v') 
+            self.data.loc[:, col] = self.data.loc[:, col].str.replace('v','').astype(np.float)
+            
+            
+        # calculate x,y
+        self.data.loc[:, 'x'] = self.data.loc[:, 'radius'] * np.sin(np.deg2rad(self.data.loc[:, 'theta']))
+        self.data.loc[:, 'y'] = self.data.loc[:, 'radius'] * np.cos(np.deg2rad(self.data.loc[:, 'theta']))
+        
+        return self.data
+        
+    def shift_model(self, dx,dy):
+        """Shift all model component positions by dx [mas] in ra and dy [mas] in dec.
+        
+        Args:
+            dx (float):
+                shift in the direction of RA
+            dy (float):
+                shift in the direction of Dec
+            
+        """
+        
+        logger.warning('Before shifting model')
+        logger.warning('origin = {}'.format(self.origin))
+        logger.warning('x = \n{}'.format(self.data.x))
+        logger.warning('y = \n{}'.format(self.data.y))
+        
+        self.origin += [dx, dy]
+        
+        self.data.loc[:, 'x'] = self.data.loc[:, 'x'] + dx 
+        self.data.loc[:, 'y'] = self.data.loc[:, 'y'] + dy 
+        
+        self.data.loc[:, 'radius'] = np.sqrt(self.data.loc[:, 'x']**2 + self.data.loc[:, 'y']**2)
+        self.data.loc[:, 'theta'] = np.rad2deg(np.arctan2(self.data.loc[:, 'x'], self.data.loc[:, 'y']))
+        
+        logger.warning('AFTER shifting model')
+        logger.warning('origin = {}'.format(self.origin))
+        logger.warning('x = \n{}'.format(self.data.x))
+        logger.warning('y = \n{}'.format(self.data.y))
+        
+        
+        
+        
+    def core_origin(self):
+        """Switch origin to the core. Core should be the first listed component in the model
+        
+        """
+        dx = -self.data.loc[0, 'x']
+        dy = -self.data.loc[0, 'y']
+        self.shift_model(dx, dy)
+
+        
 
 
 class Slice():
@@ -89,7 +199,7 @@ class Slice():
         self.data = pd.DataFrame(columns=['x', 'y', 'v', 'verr'])
         self.npoints = 100 # default
         
-    def make_slice(self, fits, start, stop, npoints=100):
+    def make_slice(self, fits, start, stop, fits_err=None, npoints=100):
         """make a slice across the data
         
         Args:
@@ -104,30 +214,75 @@ class Slice():
         
         Returns:
             slice: 
-                array with (x,y,v,verr) data. Also, self.data is modified in-place.
+                array with (x,y,d,v,verr) data. Also, self.data is modified in-place.
         """
         
         map2d = fits[0].data.squeeze()
         header = fits[0].header
         param = get_parameters(header)
         
+        self.data = pd.DataFrame(columns=['x', 'y', 'v', 'verr'])
+
         self.start = start # (x,y) in mas
         self.stop = stop   # (x,y) in mas
+        self.npoints = npoints
         
         # convert start and stop to pixels
-        start_pix =( (self.start[0] / param.masperpix + param.racenpix.values[0]).astype(int),
-                    (self.start[1] / param.masperpix + param.deccenpix.values[0]).astype(int))
+        start_pix =( (self.start[0] / param.masperpixx + param.racenpix.values[0]).astype(int),
+                    (self.start[1] / param.masperpixy + param.deccenpix.values[0]).astype(int))
 
-        stop_pix =( (self.stop[0] / param.masperpix + param.racenpix.values[0]).astype(int),
-                    (self.stop[1] / param.masperpix + param.deccenpix.values[0]).astype(int))
+        stop_pix =( (self.stop[0] / param.masperpixx + param.racenpix.values[0]).astype(int),
+                    (self.stop[1] / param.masperpixy + param.deccenpix.values[0]).astype(int))
         
-        x_pix = np.linspace(start_pix[0], stop_pix[0], npoints) # check if need to swap coordinates
-        y_pix = np.linspace(start_pix[1], stop_pix[1], npoints) # check if need to swap coordinates
         
-        self.data.x = np.linspace(start[0], stop[0], npoints) # same points in mas
-        self.data.y = np.linspace(start[1], stop[1], npoints) # same points in mas
-        self.data.v = slice_values = ndimage.map_coordinates(map2d, np.hstack((x_pix,y_pix)).T)        
+        x_pix = np.linspace(start_pix[0], stop_pix[0], self.npoints)
+        y_pix = np.linspace(start_pix[1], stop_pix[1], self.npoints)
         
+        
+        self.data.loc[:, 'x'] = np.linspace(start[0], stop[0], self.npoints) # same points in mas
+        self.data.loc[:, 'y'] = np.linspace(start[1], stop[1], self.npoints) # same points in mas
+        # swapped coordinates below since working with an image. 
+        
+        
+        # 1. scipy method. Cannot handle NaNs in the image. Includes interpolation. 
+        # => all -5000 values are getting into the slice values as valid values 
+        # (but smoothed with the edges of real RM values, hence very difficult to get rid of later)
+        self.data.loc[:, 'v'] = slice_values = ndimage.map_coordinates(map2d, np.hstack((y_pix,x_pix)).T)
+        
+        # 2. simply taking pixel values at specified coordinates. 
+        # CAVEAT: what to do when after (x,y)->(x_pix,y_pix) there are pixels with the same coordinates
+        # which should happen if npoints is large? 
+        self.data.loc[:, 'v'] = slice_values = map2d[y_pix.astype(int), x_pix.astype(int)]
+        
+        # 3. good old method of reshaping rectangle (of which the slice is a diagonal)
+        # into a square and then simply take a diagonal. 
+        # This should use no explicit interpolation and handle NaNs.
+        # CAVEAT: reshaping will use interpolation. 
+        # not written here yet
+        
+        
+        
+        
+        
+        
+        if fits_err is not None:
+            map2d_err = fits_err[0].data.squeeze()
+            # 1. 
+            self.data.loc[:, 'verr'] = ndimage.map_coordinates(map2d_err, np.hstack((y_pix,x_pix)).T)
+            # 2. 
+            self.data.loc[:, 'verr'] = map2d_err[y_pix.astype(int), x_pix.astype(int)]
+            # 3.
+            
+            
+        else:
+            # else all errors = 0
+            # 1.
+            self.data.loc[:, 'verr'] = 0.0 * ndimage.map_coordinates(map2d, np.hstack((y_pix,x_pix)).T)
+            # 2. 
+            self.data.loc[:, 'verr'] = 0.0 * map2d[y_pix.astype(int), x_pix.astype(int)]
+            # 3.
+            
+
         
         # distance along the slice
         self.data.loc[:, 'dx'] = self.data.x.diff()
@@ -137,15 +292,33 @@ class Slice():
         self.data.loc[:, 'dd'] = np.sqrt((self.data.dx)**2 + (self.data.dy)**2)
         self.data.loc[:, 'd'] = self.data.dd.cumsum()
         
-        return slice_values
+        return np.vstack((self.data.x.values, self.data.y.values, self.data.d.values, self.data.v.values, self.data.verr.values,))
         
-    def plot_slice(self):
+    def plot_slice(self, vlim=None, xlim=None, title=None):
         """Make a separate plot with slice values wrt to the distance along the slice"""
         
         fig, ax = plt.subplots(1,1)
-        ax.plot(self.data.d, self.data.v, 'o')
+        
+        distance = self.data.d
+        values = self.data.v
+        values_err = self.data.verr
+        
+        if vlim is not None:
+            ax.set_ylim(vlim)
+            index = self.data.loc[(self.data.v > vlim[0]) & (self.data.v < vlim[1]), :].index
+            distance = self.data.loc[index, 'd']
+            values = self.data.loc[index, 'v']
+            values_err = self.data.loc[index, 'verr']
+        
+        if xlim is not None:
+            ax.set_xlim(xlim)
+        
+        ax.errorbar(distance, values, yerr=values_err, fmt='-o')
+        # ax.plot(distance, values, '-o')
         ax.set_xlabel('Distance along the slice [mas]')
         ax.set_ylabel('Slice value')
+        if title is not None:
+            fig.suptitle(title)
 
 
 
@@ -158,7 +331,8 @@ class Ridgeline():
     Args:
         ridgeline_fits:
             astropy HDUList object with a map to build the ridgeline. Ridgeline is 
-            made in pixels and then converted to [mas] using FITS header info.
+            made in pixels and then converted to [mas] using FITS header info.        self.data.loc[:, 'v'] = slice_values = ndimage.map_coordinates(map2d, np.hstack((y_pix,x_pix)).T)
+
         apply_to_fits:
             astropy HDUList object to apply ridgeline to and get values. If nothing 
             is supplied, ridgeline_fits is used. 
@@ -363,22 +537,22 @@ class Ridgeline():
         
         
     
-    def apply_ridgeline(self, apply_to_fits):
+    def apply_ridgeline(self, apply_to_fits, apply_to_fits_error=None):
         """Take ridgeline coordinates and get map values at these points. 
         Useful when e.g. making the ridgeline on a Stokes I map and then getting 
         values from the RM map. Modifies self.rr[v, verr] inplace
     
         Args:
-            fits:
+            apply_to_fits:
                 astropy HDUList object with the map
-            error:
+            apply_to_fits_error:
                 astropy HDUList object with the error map
             
         Returns:
             ridgeline as a dataframe
         """
 
-        data_map = apply_to_fits[0].data.squeeze()
+        map2d = apply_to_fits[0].data.squeeze()
         # get pixel2mas convertion
         param = get_parameters(apply_to_fits[0].header)        
         MASperPIX = np.abs(param.rapixsize.values[0]*3.6e6)
@@ -387,13 +561,14 @@ class Ridgeline():
         
         self.logger.debug('APPLY: First 3 point of the ridgeline in pix: \n{}'.format(np.array([x[0:3],y[0:3]]).T))
 
-        self.rr.v = data_map[x, y]
+        self.rr.v = map2d[x, y]
         
-        # if error is not None:
-        #     error_map = error[0].data.squeeze()
-        #     rr.verr = error_map[rr.x.values.astype(int), rr.y.values.astype(int)]
+        if apply_to_fits_error is not None:
+            self.logger.warning('applying ridgeliene with error map in mind')
+            map2d_err = apply_to_fits_error[0].data.squeeze()
+            self.rr.verr = map2d_err[x, y]
     
-        return self.rr.loc[:, ['x', 'y', 'v']]
+        return self.rr.loc[:, ['x', 'y', 'v', 'verr']]
     
 
     def has_jumps(self, factor=5):
@@ -550,8 +725,8 @@ def average_rm_map(rms, rmes, logger=None):
     rm_stack = np.array(rms)
     rme_stack = np.array(rmes)
     
-    rm_stack[rm_stack < -4999.0] = np.nan
-    rme_stack[rme_stack < -4999.0] = np.nan
+    rm_stack[rm_stack < -4990.0] = np.nan
+    rme_stack[rme_stack < -4990.0] = np.nan
     
     if logger:
         logger.debug('rm[0] dimensions are: {}'.format(rms[0].shape))
@@ -786,7 +961,7 @@ def plot_rm_diff(rm1file,rm2file, contourfile = None, drm = 500, at = (0,0)):
     
 
 
-def start_plot(i,df=None, w=None, xlim = [None, None], ylim=[None, None]):
+def start_plot(i,df=None, w=None, xlim=[None, None], ylim=[None, None]):
     '''starts a plot and returns fig,ax .
     xlim, ylim - axes limits in mas
     '''
@@ -1223,14 +1398,15 @@ def get_parameters(header):
                                  'bmaj', 'bmin', 'bpa',
                                  'source', 'dateobs',
                                  'frequency',
-                                 'masperpix'],
-                        data = [[header['CRPIX1'],header['CRPIX1'],
-                                header['CDELT1'],header['CDELT1'], 
+                                 'masperpix', 'masperpixx', 'masperpixy'],
+                        data = [[header['CRPIX1'],header['CRPIX2'],
+                                header['CDELT1'],header['CDELT2'], 
                                 header['NAXIS1'],header['NAXIS2'],
                                 header['BMAJ'],header['BMIN'],header['BPA'],
                                 header['OBJECT'],header['DATE-OBS'],
                                 header['CRVAL3'], 
-                                header['CDELT1']*3.6e6]])
+                                np.abs(header['CDELT1'])*3.6e6, 
+                                header['CDELT1']*3.6e6, header['CDELT2']*3.6e6 ]])
      # MASperPIX = np.abs(self.rm[0].header['CDELT1']*3.6e6)
     
     return param  # a Pandas DataFrame
@@ -1327,77 +1503,12 @@ def plot_pmap():
 
 
 
-
-
-    
-
-
-def plot_rm(rmfile, contourfile, rmefile = None,  vlim = [-5000,5000], xlim = [4,-15], ylim = [4,-15], at = [0,0], interactive = False):    
-    '''function to plot RM from a fits file onto a contour map.
-    Should have an interactive regime to plot RM values along a slice or at a given point
-    '''
-    
-    s= re.search( 'c1-x2|x1-u1|u1-q1', rmfile)
-    suffix=s.group(0)
-    rm = read_fits(rmfile)
-    cont = read_fits(contourfile)
-    
-    try:
-        rme = read_fits(rmefile)[0].data.squeeze()
-    except:
-        rme = np.zeros(rm[0].data.squeeze().shape)
-
-    rmheader = rm[0].header
-    contheader = cont[0].header
-    rmdf = get_parameters(rmheader)
-    contdf = get_parameters(contheader)
-
-
-    # RM  
-#    PIXEL_PER_MAS = 3.6*10**6 
-#    
-#    wr = wcs.WCS( start:naxis=2)
-#    wr.wcs.crpix = [rmdf['racenpix'].values[0],rmdf['deccenpix'].values[0]+1]
-#    wr.wcs.cdelt = np.array([rmdf['rapixsize'].values[0] * PIXEL_PER_MAS, -rmdf['decpixsize'].values[0] * PIXEL_PER_MAS])  # note "-" in front of Y axis . Am I mixing axes???
-#    wr.wcs.crval = [0, 0]
-#    wr.wcs.ctype = ['RA', 'DEC']
-##    
-#    
-##    print('rm dataframe is:\n{}'.format(rmdf.iloc[0]))
-#    print('conr dataframe is:\n{}'.format(contdf.iloc[0]))
-
-#    wr = wcs.WCS(rmheader)
-#    wr = wr.celestial
-    wr = make_transform(rm)
-                 
-    
-    wc2 = wcs.WCS(contheader)
-    wc2 = wc2.celestial
-    
-    fig, ax = start_plot(cont, w=wr, xlim = xlim,  ylim = ylim)
-#    fig, ax = start_plot(cont, w=wr, xlim = [2,-7], ylim = [2,-7])
-#    fig, ax = start_plot(cont, w=wr)
-
-    plot_image(rm[0].data.squeeze(), cutoff = -4000,  vlim = vlim,  fig=fig, ax=ax, colorbar = True,
-               title = '{} on {} at {}'.format(rmdf.source.values[0], rmdf.dateobs.values[0], suffix.upper()))
-    plot_contours(cont[0].data.squeeze(), cutoff = 0.1, fig=fig, ax=ax, colors = 'grey')
-    
-    # print('>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>RM value at ({},{}) = {}'.format(at[0], at[1], rm[0].data.squeeze()[-at[1], -at[0]]))
-    # print('>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>RMerr value at ({},{}) = {}'.format(at[0], at[1], rme[-at[1], -at[0]]))
-
-    ax.plot(-at[0], -at[1], 'or')
-    
-    ax.coords[0].set_major_formatter('%.1f')
-    ax.coords[1].set_major_formatter('%.1f')
-    
-    
-    
-    return fig, ax
     
 def plot_rm_fits(rm, cont, rme = None,  vlim = [-5000,5000], xlim = [4,-15], ylim = [4,-15], 
                  at = None, interactive = False,
                  ridgeline=None,
                  ridgeline_new=None,
+                 model=None,
                  slice_coord=None,
                  logger=None,
                  suffix=None):    
@@ -1412,6 +1523,8 @@ def plot_rm_fits(rm, cont, rme = None,  vlim = [-5000,5000], xlim = [4,-15], yli
         ylim ([float]): y range in mas
         at ([float]): report RM values at this point  (mas)
         interactive (bool): if True, draw slices with mouse. 
+        model ([float]): Model() object
+            
         
     Returns:
          None   
@@ -1443,6 +1556,47 @@ def plot_rm_fits(rm, cont, rme = None,  vlim = [-5000,5000], xlim = [4,-15], yli
     plot_contours(cont[0].data.squeeze(), cutoff = 0.1, fig=fig, ax=ax, colors = 'grey')
     
     
+    if model is not None:
+        # TODO: add support for elliptical model components
+        x = model.data.x.values
+        y = model.data.y.values
+        xy = np.vstack((x, y)).T
+        major = model.data.major.values
+        axratio = model.data.axratio.values
+        
+        param = get_parameters(rm[0].header)
+        x_pix = (x /  param.masperpixx.values[0] + param.racenpix.values[0]).astype(int)
+        y_pix = (y /  param.masperpixy.values[0] + param.deccenpix.values[0]).astype(int)
+        xy_pix = np.vstack((x_pix, y_pix)).T
+        major_pix = major /  param.masperpix.values[0]
+        
+        logger.debug('x = {}'.format(x))
+        logger.debug('x_pix = {}'.format(x_pix))
+
+        logger.debug('y = {}'.format(y))
+        logger.debug('y_pix = {}'.format(y_pix))
+
+        for i,tmp in enumerate(xy_pix):
+            if major[i] < param.masperpix.values[0]:
+                ax.plot(x_pix[i], y_pix[i], 'rx')
+            else:
+                if axratio[i] < 0.1:   # a really elongated ellipce
+                    # segment_start = 
+                    # ax.plot()
+                    
+                    logger.debug('ellipce is very elongated')
+                    logger.debug('major = {} axratio = {} phi = {}'.format(major[i], axratio[i], model.data.phi.values[i]))
+                    logger.debug('major_pix = {}'.format(major_pix[i]))
+                    # ax.add_artist(mpatches.Ellipse((x_pix[i], y_pix[i]), major_pix[i]/2, 1e-2, model.data.phi.values[i]+90, alpha=0.3, fc='red'))
+                    segment_start = [ x_pix[i] - major[i] * np.cos(np.deg2rad(model.data.phi.values[i]+90)) / 2 , 
+                                     y_pix[i] - major[i] * np.sin(np.deg2rad(model.data.phi.values[i]+90)) / 2 ] 
+                    segment_end = [ x_pix[i] + major[i] * np.cos(np.deg2rad(model.data.phi.values[i]+90)) / 2 , 
+                                     y_pix[i] + major[i] * np.sin(np.deg2rad(model.data.phi.values[i]+90)) / 2 ] 
+                    ax.plot([segment_start[0], segment_end[0]], [segment_start[1], segment_end[1]], 'r-', lw=2)
+                else:
+                    ax.add_artist(plt.Circle((x_pix[i], y_pix[i]), major_pix[i]/2, alpha=0.3, fc='red'))
+    
+    
     if ridgeline is not None:
         # plot ridgeline (x, y, value)
         ax.plot(ridgeline[:,1] , ridgeline[:,0] , 'o') # note reversed order
@@ -1466,10 +1620,10 @@ def plot_rm_fits(rm, cont, rme = None,  vlim = [-5000,5000], xlim = [4,-15], yli
     if slice_coord is not None:
         """NEED TO RENAME. """
         param = get_parameters(rm[0].header)        
-        MASperPIX = np.abs(param.rapixsize.values[0]*3.6e6)
+        logger.debug('param mas per pix values for x and y are: {} and {}'.format(param.masperpixx.values[0], param.masperpixy.values[0]))
         slice_pix=[0,0]
-        slice_pix[0] = (slice_coord.data.x / MASperPIX + param.racenpix.values[0]).astype(int)
-        slice_pix[1] = (slice_coord.data.y / MASperPIX + param.deccenpix.values[0]).astype(int)
+        slice_pix[0] = (slice_coord.data.x / param.masperpixx.values[0] + param.racenpix.values[0]).astype(int)
+        slice_pix[1] = (slice_coord.data.y / param.masperpixy.values[0] + param.deccenpix.values[0]).astype(int)
 
         ax.plot(slice_pix[0], slice_pix[1], '-')
     
@@ -1483,8 +1637,6 @@ def plot_rm_fits(rm, cont, rme = None,  vlim = [-5000,5000], xlim = [4,-15], yli
     
     ax.coords[0].set_major_formatter('%.1f')
     ax.coords[1].set_major_formatter('%.1f')
-    
-    
     
     return fig, ax
     
@@ -1853,6 +2005,7 @@ def make_filelist_etc(base=None, basecont=None, source='3C273', frange='mid', lo
             xlim = [4,-20]
             ylim = [4,-20]
             rmfiles= [
+                    base+'/3c273/frm.1226+023.x1-u1.2009_06_15.fits', 
                     base+'/3c273/frm.1226+023.x1-u1.2009_08_28.fits', 
                     base+'/3c273/frm.1226+023.x1-u1.2009_10_25.fits',
                     base+'/3c273/frm.1226+023.x1-u1.2009_12_05.fits',
@@ -1860,11 +2013,13 @@ def make_filelist_etc(base=None, basecont=None, source='3C273', frange='mid', lo
             ]
             rmefiles= [
                     base+'/3c273/frme.1226+023.x1-u1.2009_08_28.fits', 
+                    base+'/3c273/frme.1226+023.x1-u1.2009_08_28.fits', 
                     base+'/3c273/frme.1226+023.x1-u1.2009_10_25.fits',
                     base+'/3c273/frme.1226+023.x1-u1.2009_12_05.fits',
                     base+'/3c273/frme.1226+023.x1-u1.2010_01_26.fits'
             ]
             contourfiles=[
+                    basecont+'/1226+023/maps4rm/1226+023.X1.2009_08_28.mid.ifits',
                     basecont+'/1226+023/maps4rm/1226+023.X1.2009_08_28.mid.ifits',
                     basecont+'/1226+023/maps4rm/1226+023.X1.2009_10_25.mid.ifits',
                     basecont+'/1226+023/maps4rm/1226+023.X1.2009_12_05.mid.ifits',
@@ -2001,9 +2156,9 @@ def rm_along_ridgeline(fits1, fits2, vlim, xlim, ylim, fits_err=None, logger=Non
     rr = Ridgeline()
     rad_max_pos = rr.make_ridgeline(fits1, steps = 100, smooth_factor=1.3, method='max')
     rr.proceed_ridgeline(remove_jumps=False, factor=6.)
-    rm_ridgeline = rr.apply_ridgeline(fits2).values
+    rm_ridgeline = rr.apply_ridgeline(fits2,fits_err).values
 
-    fig, ax = plot_rm_fits(fits2, fits1, fits_err, 
+    fig, ax = plot_rm_fits(fits2, fits1, rme=fits_err, 
                   vlim=vlim, xlim=xlim, ylim=ylim, 
                   interactive=False,
                   ridgeline_new=rm_ridgeline,
@@ -2011,10 +2166,10 @@ def rm_along_ridgeline(fits1, fits2, vlim, xlim, ylim, fits_err=None, logger=Non
                   suffix=frange)
 
     figr, axr = plt.subplots(1,1)
-    axr.plot(rr.rr.distance, rr.rr.v, '-o') # should be distance along the ridge line, not radius
-    # axr.set_yscale('log')
-    axr.set_xlabel('Distance along the ridge line [pix]')
-    axr.set_ylabel('Pixel intensity [Jy/beam?]')
+    axr.errorbar(rr.rr.distance, rr.rr.v, yerr=rr.rr.verr, fmt='-o')
+    # axr.plot(rr.rr.distance, rr.rr.v, '-o') 
+    axr.set_xlabel('Distance along the ridge line [mas]')
+    axr.set_ylabel('Ridgeline value')
     
     return rr
     
@@ -2071,11 +2226,540 @@ def doit(source='3c273', frange='mid', epoch_num=None):
     average_cont_fits[0].data = average_cont_4axes
     smooth_cont_fits[0].data = average_cont_4axes
 
-    rr = rm_along_ridgeline(smooth_cont_fits, average_rm_fits, vlim, xlim, ylim, frange=frange)
+    rr = rm_along_ridgeline(smooth_cont_fits, average_rm_fits, vlim, xlim, ylim, 
+                            frange=frange, fits_err=average_rme_fits)
     
     return rr 
 
 
+def doit_slices():
+    """Nike"""
+    #calculate average (over epochs) mapshifts 4.6 - 8.1 GHz and 8.1-15.4 GHz in RA,DEC
+    # 4.6 - ref freq for LOW, 8.1 - ref freq for MID, 15.4 -ref freq for HIG
+    #
+    # 4.6 - 8.1 GHz
+    # dRA_avg = ((0.131 + 0.522) + (-0.062 + 0.525) + (0.102 + 0.228) + (0.298 + 0.352))/4
+    # dDEC_avg = ((0.209 + 0.266) + (0.213 + 0.650) + (0.039 + 0.163) + (0.402 + 0.372))/4
+    #
+    # 8.1 - 15.4 
+    # dRA_avg = ((0.241 + 0.103) + (-0.00333 + 0.315) + (0.068 + 0.265) + (-0.018 + 0.273))/4
+    # dDEC_avg = ((0.437 + 0.201) + (0.163 + 0.222) + (-0.0025 + 0.379) + (-0.028 + 0.438))/4
+    
+    source = '3c273'
+
+    if 1:
+    
+        frange='low'
+        
+        # low frequencies
+        s = Slice()
+        rmfiles, rmefiles, contourfiles, vlim, xlim, ylim = make_filelist_etc(base, basecont, source, frange)
+        cc = read_fits(contourfiles[0])
+        rm = read_fits(rmfiles[0])
+        
+        # average RM epochs here
+        average_rm_fits = read_fits(rmfiles[0]) # contains metadata. The data will be replaced with average
+        average_rme_fits = read_fits(rmefiles[0])
+        rm_maps = list(map(lambda x: read_fits(x)[0].data.squeeze() ,rmfiles))
+        rme_maps = list(map(lambda x: read_fits(x)[0].data.squeeze() ,rmefiles))
+        average_rm, average_rme = average_rm_map(rm_maps, rme_maps, logger=logger)
+        # average_rm[average_rm < -4999.0]=np.nan # with this, scipy.map_coordinates will not work.
+        average_rm_fits[0].data = np.expand_dims(average_rm, axis=(0,1))
+        average_rme_fits[0].data = np.expand_dims(average_rme, axis=(0,1))
+        
+        # top position (most positive RM)
+        # v = s.make_slice(average_rm_fits, (0,0), (-17,-10), npoints=50, fits_err=average_rme_fits)
+        # s.plot_slice(vlim=[-650, 200], xlim=[0, 20])
+        # middle jet position
+        # v_low_middle = s.make_slice(average_rm_fits, (0,0), (-18.8,-13.3), npoints=100, fits_err=average_rme_fits)
+        v_low_middle = s.make_slice(average_rm_fits, (0.5,0.5), (-18.8,-13.3), npoints=100, fits_err=average_rme_fits)
+        s.plot_slice(vlim=[-500, 1000], xlim=[-1, 20], title='Equatorial slice. {} freq'.format(frange.upper()))
+        
+        # v_low_middle_perp = s.make_slice(average_rm_fits, (-2.2, -4.2), (-4.6, 0.4), npoints=50, fits_err=average_rme_fits)
+        # s.plot_slice(vlim=[-500, 1000], xlim=[-1, 7], title='Equatorial slice. {} freq'.format(frange.upper()))
+        
+        # bottom position (most negative RM)
+        # v = s.make_slice(average_rm_fits, (0,0), (-8.6,-8.8), npoints=50, fits_err=average_rme_fits)
+        # s.plot_slice(vlim=[-650, 200], xlim=[0, 20])
+    
+        # bottom position (most negative RM). Short, as at hig
+        # v_low_south = s.make_slice(average_rm_fits, (0,0), (-2.8,-4.1), npoints=50, fits_err=average_rme_fits)
+        # v_low_south = s.make_slice(average_rm_fits, (0.6,1.1), (-4.8,-6.7), npoints=50, fits_err=average_rme_fits)
+        # s.plot_slice(vlim=[-750, 500], xlim=[-1, 10], title='South slice. {} freq'.format(frange.upper()))
+    
+    
+        fig, ax = plot_rm_fits(average_rm_fits, read_fits(contourfiles[0]), average_rme_fits, 
+                  vlim=vlim, xlim=xlim, ylim=ylim, 
+                  interactive=False,
+                  logger=logger,
+                  slice_coord=s,
+                  suffix=frange)
+        
+
+    
+    if 1:
+    
+        # mid frequencies
+        frange = 'mid'
+    
+        s = Slice()
+        rmfiles, rmefiles, contourfiles, vlim, xlim, ylim = make_filelist_etc(base, basecont, source, frange)
+        cc = read_fits(contourfiles[0])
+        rm = read_fits(rmfiles[0])
+        
+        
+        # average RM epochs here
+        average_rm_fits = read_fits(rmfiles[0]) # contains metadata. The data will be replaced with average
+        average_rme_fits = read_fits(rmefiles[0])
+        rm_maps = list(map(lambda x: read_fits(x)[0].data.squeeze() ,rmfiles))
+        rme_maps = list(map(lambda x: read_fits(x)[0].data.squeeze() ,rmefiles))
+        average_rm, average_rme = average_rm_map(rm_maps, rme_maps, logger=logger)
+        # average_rm[average_rm < -4999.0]=np.nan # with this, scipy.map_coordinates will not work.
+        average_rm_fits[0].data = np.expand_dims(average_rm, axis=(0,1))
+        average_rme_fits[0].data = np.expand_dims(average_rme, axis=(0,1))
+        
+        # shift RM and RME maps
+        param = get_parameters(average_rm_fits[0].header)
+        # initially used LOW-MID map shift of (0.57, 0.57)
+        average_rm_fits[0].header['CRPIX1'] = average_rm_fits[0].header['CRPIX1'] - np.int(0.524/param.masperpixx)
+        average_rm_fits[0].header['CRPIX2'] = average_rm_fits[0].header['CRPIX2'] - np.int(0.579/param.masperpixy)
+        param = get_parameters(average_rm_fits[0].header)
+        
+        # top position (most positive RM)
+        # v = s.make_slice(average_rm_fits, (0,0), (-17,-10), npoints=50, fits_err=average_rme_fits)
+        # s.plot_slice(vlim=[-650, 200], xlim=[0, 20])
+        # middle jet position
+        # v_mid_middle = s.make_slice(average_rm_fits, (0,0), (-18.8,-13.3), npoints=100, fits_err=average_rme_fits)
+        v_mid_middle = s.make_slice(average_rm_fits, (0.5,0.5), (-18.8,-13.3), npoints=100, fits_err=average_rme_fits)
+        s.plot_slice(vlim=[-500, 1000], xlim=[-1, 20], title='Equatorial slice. {} freq'.format(frange.upper()))
+        
+        v_mid_middle_perp = s.make_slice(average_rm_fits,  (-2.2, -4.2), (-4.6, 0.4), npoints=50, fits_err=average_rme_fits)
+        s.plot_slice(vlim=[-500, 1000], xlim=[-1, 7], title='Equatorial slice. {} freq'.format(frange.upper()))
+        
+
+        
+        # bottom position (most negative RM)
+        # v = s.make_slice(average_rm_fits, (0,0), (-8.6,-8.8), npoints=50, fits_err=average_rme_fits)
+        # s.plot_slice(vlim=[-650, 200], xlim=[0, 20])
+        
+        # bottom position (most negative RM). Short, as at hig
+        # v_mid_south = s.make_slice(average_rm_fits, (0,0), (-2.8,-4.1), npoints=50, fits_err=average_rme_fits)
+        # v_mid_south = s.make_slice(average_rm_fits, (0.6,1.1), (-4.8,-6.7), npoints=50, fits_err=average_rme_fits)
+        # s.plot_slice(vlim=[-1000, 1000], xlim=[-1, 10], title='South slice. {} freq'.format(frange.upper()))
+        
+        fig, ax = plot_rm_fits(average_rm_fits, read_fits(contourfiles[0]), average_rme_fits, 
+                  vlim=vlim, xlim=xlim, ylim=ylim, 
+                  interactive=False,
+                  logger=logger,
+                  slice_coord=s,
+                  suffix=frange)
+        
+
+
+    if 0:
+        ############################################3
+        # high frequencies
+        frange = 'hig'
+    
+        s = Slice()
+        rmfiles, rmefiles, contourfiles, vlim, xlim, ylim = make_filelist_etc(base, basecont, source, frange)
+        cc = read_fits(contourfiles[0])
+        rm = read_fits(rmfiles[0])
+        
+        
+        # average RM epochs here
+        average_rm_fits = read_fits(rmfiles[1]) # contains metadata. The data will be replaced with average
+        average_rme_fits = read_fits(rmefiles[1])
+        rm_maps = list(map(lambda x: read_fits(x)[0].data.squeeze() ,rmfiles))
+        rme_maps = list(map(lambda x: read_fits(x)[0].data.squeeze() ,rmefiles))
+        average_rm, average_rme = average_rm_map(rm_maps, rme_maps, logger=logger)
+        # average_rm[average_rm < -4999.0]=np.nan # with this, scipy.map_coordinates will not work.
+        average_rm_fits[0].data = np.expand_dims(average_rm, axis=(0,1))
+        average_rme_fits[0].data = np.expand_dims(average_rme, axis=(0,1))
+        
+        # shift RM and RME maps
+        param = get_parameters(average_rm_fits[0].header)
+        # initially used MID-HIG map shift of (0.42, 0.42)
+        average_rm_fits[0].header['CRPIX1'] = average_rm_fits[0].header['CRPIX1'] - np.int((0.524+0.311)/param.masperpixx)
+        average_rm_fits[0].header['CRPIX2'] = average_rm_fits[0].header['CRPIX2'] - np.int((0.579+0.452)/param.masperpixy)
+        param = get_parameters(average_rm_fits[0].header)
+    
+        # top position (most positive RM)
+        # v = s.make_slice(average_rm_fits, (0,0), (-17,-10), npoints=50, fits_err=average_rme_fits)
+        # s.plot_slice(vlim=[-650, 200], xlim=[0, 20])
+        # middle jet position
+        # v_mid = s.make_slice(average_rm_fits, (0,0), (-18.8,-13.3), npoints=50, fits_err=average_rme_fits)
+        # s.plot_slice(vlim=[-500, 1000], xlim=[0, 20])
+        # bottom position (most negative RM)
+        # v_hig_south = s.make_slice(average_rm_fits, (0,0), (-2.8,-4.1), npoints=50, fits_err=average_rme_fits)
+        v_hig_south = s.make_slice(average_rm_fits, (0.6,1.1), (-4.8,-6.7), npoints=50, fits_err=average_rme_fits)
+        s.plot_slice(vlim=[-2000, 2500], xlim=[-1, 10], title='South slice. {} freq'.format(frange.upper()))
+    
+        fig, ax = plot_rm_fits(average_rm_fits, read_fits(contourfiles[0]), average_rme_fits, 
+                  vlim=vlim, xlim=xlim, ylim=ylim, 
+                  interactive=False,
+                  logger=logger,
+                  slice_coord=s,
+                  suffix=frange)
+        
+    
+    if 0:
+        # plot three south slices in one plot. 
+        fig, ax = plt.subplots(1,1)
+        vlim=[-1000,2000]
+        v_low_south = v_low_south[:, (v_low_south[3] > vlim[0]) & (v_low_south[3] < vlim[1])]
+        v_mid_south = v_mid_south[:, (v_mid_south[3] > vlim[0]) & (v_mid_south[3] < vlim[1])]
+        v_hig_south = v_hig_south[:, (v_hig_south[3] > vlim[0]) & (v_hig_south[3] < vlim[1])]
+        ax.errorbar(v_low_south[2], v_low_south[3], yerr=v_low_south[4], fmt='b-o', label='LOW')
+        ax.errorbar(v_mid_south[2], v_mid_south[3], yerr=v_mid_south[4], fmt='g-o', label='MID')
+        ax.errorbar(v_hig_south[2], v_hig_south[3], yerr=v_hig_south[4], fmt='r-o', label='HIG')
+        
+        ax.set_ylim(vlim)
+        ax.set_xlabel('Distance along the slice [mas]')
+        ax.set_ylabel('RM [rad/m2]')
+        fig.suptitle("3C273. Southern edge.\nSame slice taken in three freq ranges: LOW, MID, and HIG. ")
+        ax.legend()
+    
+    if 1:
+        # plot two middle slices in one plot. 
+        fig, ax = plt.subplots(1,1)
+        vlim=[-1000,1000]
+        v_low_middle = v_low_middle[:, (v_low_middle[3] > vlim[0]) & (v_low_middle[3] < vlim[1])]
+        v_mid_middle = v_mid_middle[:, (v_mid_middle[3] > vlim[0]) & (v_mid_middle[3] < vlim[1])]
+        ax.errorbar(v_low_middle[2], v_low_middle[3], yerr=v_low_middle[4], fmt='b-o', label='LOW')
+        ax.errorbar(v_mid_middle[2], v_mid_middle[3], yerr=v_mid_middle[4], fmt='g-o', label='MID')
+        
+        
+        # ax.set_xlim([3,6])
+        
+        ax.set_ylim(vlim)
+        ax.set_xlabel('Distance along the slice [mas]')
+        ax.set_ylabel('RM [rad/m2]')
+        fig.suptitle("3C273. middle edge.\nSame slice taken in two freq ranges: LOW and MID. ")
+        ax.legend()
+        
+        
+def doit_tvar_low(model=None):
+    """Explore time variability at hig frange. Maps are not averaged."""
+    source = '3c273'
+    frange = 'low'
+
+    model_files = ['/homes/mlisakov/data/S2087A/polar/1226+023/models/1226+023.c1.2009_08_28.mdl',
+                   '/homes/mlisakov/data/S2087A/polar/1226+023/models/1226+023.c1.2009_10_25.mdl',
+                   '/homes/mlisakov/data/S2087A/polar/1226+023/models/1226+023.c1.2009_12_05.mdl',
+                   '/homes/mlisakov/data/S2087A/polar/1226+023/models/1226+023.c1.2010_01_26.mdl']
+
+
+    s = Slice()
+    rmfiles, rmefiles, contourfiles, vlim, xlim, ylim = make_filelist_etc(base, basecont, source, frange)
+    
+    v_slices = np.array([])
+    
+    for i,r in enumerate(rmfiles):
+        
+        model = Model()
+        model.read_model(model_files[i])
+        # model.shift_model(0.835, 1.031)
+        
+        print('model ({}):\n{} '.format(i, model.data.loc[:, ['major', 'axratio', 'phi']]))
+        
+        
+        rm_fits = read_fits(rmfiles[i])
+        rme_fits = read_fits(rmefiles[i])
+        cont_fits = read_fits(contourfiles[i])
+        param = get_parameters(rm_fits[0].header)
+        
+        # shift core to (0,0)
+        # in the map
+        rm_fits[0].header['CRPIX1'] = rm_fits[0].header['CRPIX1'] - np.int((-model.data.loc[0,'x'])/param.masperpixx)
+        rm_fits[0].header['CRPIX2'] = rm_fits[0].header['CRPIX2'] - np.int((-model.data.loc[0,'y'])/param.masperpixy)
+        # in the model
+        model.core_origin()
+        # COMPARE THIS TO THE DIFMAP MAP WITH MODELS./ 
+        # Model components are consistent with Difmap. Maybe to a 1 pixel precision. 
+        # Contour 
+        
+        
+        param = get_parameters(rm_fits[0].header)
+        v_slice = s.make_slice(rm_fits, (0.5,0.5), (-18.8,-13.3), npoints=200, fits_err=rme_fits)
+        # previously used this one
+        # v_slice = s.make_slice(rm_fits, (0.5,0.5), (-18.8,-13.3), npoints=200, fits_err=rme_fits)
+        # v_low_south = s.make_slice(rm_fits, (0.8,0.8), (-1.7,-2.7), npoints=50, fits_err=rme_fits)
+        v_slices = np.append(v_slices, v_slice)
+
+
+        fig, ax = plot_rm_fits(rm_fits, cont_fits, rme_fits, 
+                  vlim=vlim, xlim=[2,-15], ylim=[2,-15], 
+                  interactive=False,
+                  logger=logger,
+                  slice_coord=s,
+                  suffix=frange,
+                  model=model)
+                
+    # all epochs in one plot
+    epochs = ['A','B','C','E']
+    vp = v_slices.reshape((4,5,-1))
+    fig, ax = plt.subplots(1,1)
+    vlim=[-1100,700]
+    # average (to check average_RM done by averaging the maps)
+    vp_nan = vp
+
+    for i in (0,1,2,3):
+        vp_nan[i, 3, vp_nan[i, 3, :] < -4990.0] = np.nan
+        vp_nan[i, 4, vp_nan[i, 4, :] < -4990.0] = np.nan
+        
+        d = vp[i, 2, (vp[i,3,:]>vlim[0]) & (vp[i,3,:]<vlim[1])]
+        v = vp[i, 3, (vp[i,3,:]>vlim[0]) & (vp[i,3,:]<vlim[1])]
+        verr = vp[i, 4, (vp[i,3,:]>vlim[0]) & (vp[i,3,:]<vlim[1])]
+        ax.errorbar(d, v, yerr=verr, fmt='-o', label=epochs[i])
+
+
+    ax.set_ylim(vlim)
+    ax.set_xlim([0,25])
+    vp_nan_aver = np.nanmean(vp_nan, axis = 0)
+    # ax.plot(vp_nan_aver[2, :], vp_nan_aver[3, :], 'k-', lw=3, label='mean')
+    ax.legend()
+    ax.set_xlabel('Distance along the slice [mas]')
+    ax.set_ylabel('RM [rad/m2]')
+    fig.suptitle("3C273. LOW")
+    
+    
+    # All epochs in one plot. |RM|
+    epochs = ['A','B','C','E']
+    vp = v_slices.reshape((4,5,-1))
+    fig, ax = plt.subplots(1,1)
+    vlim=[-1100,1100]
+    # average (to check average_RM done by averaging the maps)
+    vp_nan = vp
+    
+
+    
+    for i in (0,1,2,3):
+        vp_nan[i, 3, vp_nan[i, 3, :] < -4990.0] = np.nan
+        vp_nan[i, 4, vp_nan[i, 4, :] < -4990.0] = np.nan
+        
+        d = vp[i, 2, (vp[i,3,:]>vlim[0]) & (vp[i,3,:]<vlim[1])]
+        v = np.abs(vp[i, 3, (vp[i,3,:]>vlim[0]) & (vp[i,3,:]<vlim[1])])
+        verr = vp[i, 4, (vp[i,3,:]>vlim[0]) & (vp[i,3,:]<vlim[1])]
+        ax.errorbar(d, v, yerr=verr, fmt='-o', label=epochs[i])
+
+
+
+
+
+    v_aver = np.array([])
+    for i in (0,1,2,3):
+        v = np.abs(vp[i, 3, vp[i, 2, :] > 4.0 ])
+        d = np.abs(vp[i, 2, vp[i, 2, :] > 4.0 ])
+
+        v_aver = np.append(v_aver, v)
+
+    # fit average and plot
+    print('v_aver shape is {}'.format(v_aver.shape))
+    v_aver = np.nanmean(v_aver.reshape(4,-1), axis=0)
+    print('v_aver shape is {}'.format(v_aver.shape))
+    ax.plot(d, v_aver, '-k', lw=3.0)
+
+    def func(x ,a, b, c, d):
+        return a * np.exp(b*(x + c)) + d
+
+    popt, pcov = curve_fit(func,  d,  v_aver, p0=(1000.0, -1.0, 2.0, 0.0))
+    
+    x = np.arange(-5, 25)
+    ax.plot(x, func(x, *popt), '-k', lw=3.0, label='fit to average. b={:.2f}'.format(popt[1]), zorder = 100)
+    
+
+    ax.set_ylim([-100, 1100])
+    ax.set_xlim([0,25])
+    vp_nan_aver = np.nanmean(vp_nan, axis = 0)
+    # ax.plot(vp_nan_aver[2, :], vp_nan_aver[3, :], 'k-', lw=3, label='mean')
+    ax.legend()
+    ax.set_xlabel('Distance along the slice [mas]')
+    ax.set_ylabel('RM [rad/m2]')
+    fig.suptitle("3C273. LOW. |RM|")
+    
+    
+    
+    
+def doit_tvar_hig(model=None):
+    """Explore time variability at hig frange. Maps are not averaged."""
+    source = '3c273'
+    frange = 'hig'
+
+    model_files = ['/homes/mlisakov/data/S2087A/polar/1226+023/models/1226+023.k1.2009_08_28.mdl',
+                   '/homes/mlisakov/data/S2087A/polar/1226+023/models/1226+023.k1.2009_10_25.mdl',
+                   '/homes/mlisakov/data/S2087A/polar/1226+023/models/1226+023.k1.2009_12_05.mdl',
+                   '/homes/mlisakov/data/S2087A/polar/1226+023/models/1226+023.k1.2010_01_26.mdl']
+
+
+    s = Slice()
+    rmfiles, rmefiles, contourfiles, vlim, xlim, ylim = make_filelist_etc(base, basecont, source, frange)
+    
+    # v_hig_south_slices = np.zeros(len(rmfiles))
+    v_hig_south_slices = np.array([])
+    
+    
+    # shift model in the same way as the map itself
+    if model is not None:
+        model.shift_model(0.835, 1.031)
+
+    for i,r in enumerate(rmfiles):
+        
+        model = Model()
+        model.read_model(model_files[i])
+        model.shift_model(0.835, 1.031)
+        
+        
+        
+        rm_fits = read_fits(rmfiles[i])
+        rme_fits = read_fits(rmefiles[i])
+        cont_fits = read_fits(contourfiles[i])
+        param = get_parameters(rm_fits[0].header)
+        
+        # average over epochs mapshift
+        rm_fits[0].header['CRPIX1'] = rm_fits[0].header['CRPIX1'] - np.int((0.524+0.311)/param.masperpixx)
+        rm_fits[0].header['CRPIX2'] = rm_fits[0].header['CRPIX2'] - np.int((0.579+0.452)/param.masperpixy)
+        
+        param = get_parameters(rm_fits[0].header)
+        # top position (most positive RM)
+        # v = s.make_slice(average_rm_fits, (0,0), (-17,-10), npoints=50, fits_err=average_rme_fits)
+        # s.plot_slice(vlim=[-650, 200], xlim=[0, 20])
+        # middle jet position
+        # v_mid = s.make_slice(average_rm_fits, (0,0), (-18.8,-13.3), npoints=50, fits_err=average_rme_fits)
+        # s.plot_slice(vlim=[-500, 1000], xlim=[0, 20])
+        # bottom position (most negative RM)
+        # v_hig_south = s.make_slice(rm_fits, (0.6,1.1), (-4.8,-6.7), npoints=50, fits_err=rme_fits)
+        # v_hig_south = s.make_slice(rm_fits, (0.6,1.1), (-2.1,-2.8), npoints=50, fits_err=rme_fits)
+        v_hig_south = s.make_slice(rm_fits, (0.8,0.8), (-1.7,-2.7), npoints=50, fits_err=rme_fits)
+        # s.plot_slice(vlim=[-4000, 4000], xlim=[-0.1, 5], title='South slice. {} freq'.format(frange.upper()))
+        
+        v_hig_south_slices = np.append(v_hig_south_slices, v_hig_south)
+        
+
+        fig, ax = plot_rm_fits(rm_fits, cont_fits, rme_fits, 
+                  vlim=vlim, xlim=[2,-4], ylim=[2,-4], 
+                  interactive=False,
+                  logger=logger,
+                  slice_coord=s,
+                  suffix=frange,
+                  model=model)
+                
+    # all epochs in one plot
+    epochs = ['A','B','C','E']
+    vp = v_hig_south_slices.reshape((4,5,-1))
+    fig, ax = plt.subplots(1,1)
+    vlim=[-4000,4000]
+    # average (to check average_RM done by averaging the maps)
+    vp_nan = vp
+
+    for i in (0,1,2,3):
+        vp_nan[i, 3, vp_nan[i, 3, :] < -4990.0] = np.nan
+        vp_nan[i, 4, vp_nan[i, 4, :] < -4990.0] = np.nan
+        
+        d = vp[i, 2, (vp[i,3,:]>vlim[0]) & (vp[i,3,:]<vlim[1])]
+        v = vp[i, 3, (vp[i,3,:]>vlim[0]) & (vp[i,3,:]<vlim[1])]
+        v_aver = np.append(v_aver, v)
+        verr = vp[i, 4, (vp[i,3,:]>vlim[0]) & (vp[i,3,:]<vlim[1])]
+        ax.errorbar(d, v, yerr=verr, fmt='-o', label=epochs[i])
+
+
+    # fit average and plot
+    print('v_aver shape is {}'.format(v_aver.shape))
+    v_aver = np.nanmean(v_aver)
+    print('v_aver shape is {}'.format(v_aver.shape))
+
+    ax.set_ylim(vlim)
+    ax.set_xlim([0,4.5])
+    vp_nan_aver = np.nanmean(vp_nan, axis = 0)
+    # ax.plot(vp_nan_aver[2, :], vp_nan_aver[3, :], 'k-', lw=3, label='mean')
+    ax.legend()
+    ax.set_xlabel('Distance along the slice [mas]')
+    ax.set_ylabel('RM [rad/m2]')
+    fig.suptitle("3C273. HIG")
+
+def doit_tvar_mid():
+    """Explore time variability at hig frange. Maps are not averaged."""
+    source = '3c273'
+    frange = 'mid'
+
+    s = Slice()
+    rmfiles, rmefiles, contourfiles, vlim, xlim, ylim = make_filelist_etc(base, basecont, source, frange)
+    
+    # v_hig_south_slices = np.zeros(len(rmfiles))
+    v_hig_south_slices = np.array([])
+    
+    
+    for i,r in enumerate(rmfiles):
+        rm_fits = read_fits(rmfiles[i])
+        rme_fits = read_fits(rmefiles[i])
+        cont_fits = read_fits(contourfiles[i])
+        param = get_parameters(rm_fits[0].header)
+        
+        # average over epochs mapshift
+        rm_fits[0].header['CRPIX1'] = rm_fits[0].header['CRPIX1'] - np.int((0.524)/param.masperpixx)
+        rm_fits[0].header['CRPIX2'] = rm_fits[0].header['CRPIX2'] - np.int((0.579)/param.masperpixy)
+        param = get_parameters(rm_fits[0].header)
+    
+    
+
+    # top position (most positive RM)
+    # v = s.make_slice(average_rm_fits, (0,0), (-17,-10), npoints=50, fits_err=average_rme_fits)
+    # s.plot_slice(vlim=[-650, 200], xlim=[0, 20])
+    # middle jet position
+    # v_mid = s.make_slice(average_rm_fits, (0,0), (-18.8,-13.3), npoints=150, fits_err=average_rme_fits)
+    # s.plot_slice(vlim=[-500, 1000], xlim=[0, 20])
+        v_mid = s.make_slice(rm_fits, (0,0), (-18.8,-13.3), npoints=150, fits_err=rme_fits)
+        s.plot_slice(vlim=[-500, 1000], xlim=[0, 20])
+        
+    # bottom position (most negative RM)
+        # v_hig_south = s.make_slice(rm_fits, (0.6,1.1), (-4.8,-6.7), npoints=50, fits_err=rme_fits)
+        # v_hig_south = s.make_slice(rm_fits, (0.6,1.1), (-2.1,-2.8), npoints=50, fits_err=rme_fits)
+        # v_hig_south = s.make_slice(rm_fits, (0.8,0.8), (-1.7,-2.7), npoints=50, fits_err=rme_fits)
+        # s.plot_slice(vlim=[-4000, 4000], xlim=[-0.1, 5], title='South slice. {} freq'.format(frange.upper()))
+        
+        
+        
+        
+        # v_hig_south_slices = np.append(v_hig_south_slices, v_hig_south)
+        v_hig_south_slices = np.append(v_hig_south_slices, v_mid)
+        
+        
+        fig, ax = plot_rm_fits(rm_fits, cont_fits, rme_fits, 
+                  vlim=vlim, xlim=[2,-4], ylim=[2,-4], 
+                  interactive=False,
+                  logger=logger,
+                  slice_coord=s,
+                  suffix=frange)
+            
+    
+
+
+
+    # all epochs in one plot
+    epochs = ['Z','A','B','C','E']
+    vp = v_hig_south_slices.reshape((len(epochs),5,-1))
+    fig, ax = plt.subplots(1,1)
+    vlim=[-4000,4000]
+    # average (to check average_RM done by averaging the maps)
+    vp_nan = vp
+
+    for i in range(0,len(epochs)):
+        vp_nan[i, 3, vp_nan[i, 3, :] < -4990.0] = np.nan
+        vp_nan[i, 4, vp_nan[i, 4, :] < -4990.0] = np.nan
+        
+        d = vp[i, 2, (vp[i,3,:]>vlim[0]) & (vp[i,3,:]<vlim[1])]
+        v = vp[i, 3, (vp[i,3,:]>vlim[0]) & (vp[i,3,:]<vlim[1])]
+        verr = vp[i, 4, (vp[i,3,:]>vlim[0]) & (vp[i,3,:]<vlim[1])]
+        ax.errorbar(d, v, yerr=verr, fmt='-o', label=epochs[i])
+    
+    ax.set_ylim(vlim)
+    ax.set_xlim([0,4.5])
+    vp_nan_aver = np.nanmean(vp_nan, axis = 0)
+    # ax.plot(vp_nan_aver[2, :], vp_nan_aver[3, :], 'k-', lw=3, label='mean')
+    ax.legend()
+    ax.set_xlabel('Distance along the slice [mas]')
+    ax.set_ylabel('RM [rad/m2]')
+    fig.suptitle("3C273. MID")
 
 
 
@@ -2099,9 +2783,6 @@ if __name__== "__main__":
         tmp =  '/home/mikhail/tmp'
         plots = '/home/mikhail/sci/pol/plots'
     
-    source = '3c273'
-    frange = 'mid'
-    
 
 
     # DISCLAIMER: 
@@ -2115,36 +2796,100 @@ if __name__== "__main__":
         
     #     
     
-    s = Slice()
-    rmfiles, rmefiles, contourfiles, vlim, xlim, ylim = make_filelist_etc(base, basecont, source, frange)
-    cc = read_fits(contourfiles[0])
-    rm = read_fits(rmfiles[0])
-    # v = s.make_slice(cc, (0,0), (16,-10), npoints=200)
-    v = s.make_slice(rm, (0,0), (7,-13), npoints=200)   # CHECK COORDINATES 
-    # BOTH ON THE MAP AND IN GETTING VALEUS!!!!
-    #
-    #
-    #
-    #
-    s.plot_slice() 
-    fig, ax = plot_rm_fits(read_fits(rmfiles[0]), read_fits(contourfiles[0]), read_fits(rmefiles[0]), 
-              vlim=vlim, xlim=xlim, ylim=ylim, 
-              interactive=False,
-              logger=logger,
-              slice_coord=s,
-              suffix=frange)
+    # CAVEAT
+        # 
+        # TODO: Add errors of singe epochs in quadrature when averaging
+        # 
+        # 
+    
+    
+    
+#     # do slices for all 3 freqs
+    # doit_slices()
+
+    # m = Model()
+    # gg= m.read_model('/homes/mlisakov/data/S2087A/polar/1226+023/models/1226+023.q1.2009_10_25.mdl')
+    # gg= m.read_model('/homes/mlisakov/data/S2087A/polar/1226+023/models/1226+023.k1.2009_10_25.mdl')
 
 
+    
+    # explore time variability at hig
+    # doit_tvar_hig(model=m) 
+    doit_tvar_mid()
+    # doit_tvar_low()
+    
+    
+    
+
+    
+    
+    
+    
+    
+    
+#     source = '3c273'
+#     frange='low'
+
+#     # low frequencies
+#     s = Slice()
+#     rmfiles, rmefiles, contourfiles, vlim, xlim, ylim = make_filelist_etc(base, basecont, source, frange)
+#     cc = read_fits(contourfiles[0])
+#     rm = read_fits(rmfiles[0])
+    
+#     # average RM epochs here
+#     average_rm_fits = read_fits(rmfiles[0]) # contains metadata. The data will be replaced with average
+#     average_rme_fits = read_fits(rmefiles[0])
+#     rm_maps = list(map(lambda x: read_fits(x)[0].data.squeeze() ,rmfiles))
+#     rme_maps = list(map(lambda x: read_fits(x)[0].data.squeeze() ,rmefiles))
+#     average_rm, average_rme = average_rm_map(rm_maps, rme_maps, logger=logger)
+#     # average_rm[average_rm < -4999.0]=np.nan # with this, scipy.map_coordinates will not work.
+#     average_rm_fits[0].data = np.expand_dims(average_rm, axis=(0,1))
+#     average_rme_fits[0].data = np.expand_dims(average_rme, axis=(0,1))
+    
+#     # top position (most positive RM)
+#     # v = s.make_slice(average_rm_fits, (0,0), (-17,-10), npoints=50, fits_err=average_rme_fits)
+#     # s.plot_slice(vlim=[-650, 200], xlim=[0, 20])
+#     # middle jet position
+#     # v_low_middle = s.make_slice(average_rm_fits, (0,0), (-18.8,-13.3), npoints=100, fits_err=average_rme_fits)
+#     v_low_middle = s.make_slice(average_rm_fits, (0.5,0.5), (-18.8,-13.3), npoints=100, fits_err=average_rme_fits)
+#     s.plot_slice(vlim=[-500, 1000], xlim=[-1, 20], title='Equatorial slice. {} freq'.format(frange.upper()))
+    
+#     # bottom position (most negative RM)
+#     # v = s.make_slice(average_rm_fits, (0,0), (-8.6,-8.8), npoints=50, fits_err=average_rme_fits)
+#     # s.plot_slice(vlim=[-650, 200], xlim=[0, 20])
+
+#     # bottom position (most negative RM). Short, as at hig
+#     # v_low_south = s.make_slice(average_rm_fits, (0,0), (-2.8,-4.1), npoints=50, fits_err=average_rme_fits)
+#     v_low_south = s.make_slice(average_rm_fits, (0.6,1.1), (-4.8,-6.7), npoints=50, fits_err=average_rme_fits)
+#     s.plot_slice(vlim=[-750, 500], xlim=[-1, 10], title='South slice. {} freq'.format(frange.upper()))
+
+
+#     fig, ax = plot_rm_fits(average_rm_fits, read_fits(contourfiles[0]), average_rme_fits, 
+#               vlim=vlim, xlim=xlim, ylim=ylim, 
+#               interactive=True,
+#               logger=logger,
+#               slice_coord=s,
+#               suffix=frange)
+    
+#     line, = ax.plot([0], [0])  # empty line
+#     ab = ArrowBuilder(line, ax, rm=average_rm_fits, rme=average_rme_fits, cont=cc)
+# #        ab = ArrowBuilder(line,ax, outslice = tmp+'/slice_B_hig.pkl', outbeam = tmp+'/beam_B_hig.pkl')
+
+
+
+    # ridgeline part starts here
     # proceed three freq ranges separately: 
     # average all dates together, make a ridgeline, plot everything
     #     
+    source = '3c273'
+    
     # rr1 = doit(source=source, frange='low')
-    # rr2 = doit(source=source, frange='mid')
+    rr2 = doit(source=source, frange='mid')
     # rr3 = doit(source=source, frange='hig')
 
     
-    #proceed epochs idividually
-    # frange = 'mid'
+    # proceed epochs idividually
+    # frange = 'hig'
     # logger.info('\n' + '='*50 + '\nsource = {} frange = {} epoch_num = {}\n'.format(source, frange, 0) + '='*50)
     # rr1 = doit(source=source, frange=frange, epoch_num=0)
     # logger.info('\n' + '='*50 + '\nsource = {} frange = {} epoch_num = {}\n'.format(source, frange, 1) + '='*50)
@@ -2157,6 +2902,11 @@ if __name__== "__main__":
     
 
 
-    
+
+    # Epochs      days
+    # 2009-08-28: 0
+    # 2009-10_25: 58
+    # 2009-12-05: 99
+    # 2010-01-26: 151
 
     
